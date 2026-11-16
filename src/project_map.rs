@@ -16,19 +16,66 @@ use crate::sync::discovery::{extract_project_name, find_local_project_by_name};
 /// Canonical id -> absolute project path, as configured per machine.
 pub type ProjectMap = BTreeMap<String, PathBuf>;
 
+/// The longest directory name Claude Code writes before it shortens one.
+const MAX_ENCODED_LENGTH: usize = 200;
+
 /// Encode a project path the way Claude Code names `~/.claude/projects/<dir>`.
 ///
 /// Claude Code derives the directory with a JavaScript regex, which runs over
 /// UTF-16 code units. A byte-wise version emits a different name for any
 /// non-ASCII path, and files then land in a directory Claude Code never reads.
 pub fn encode_project_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .encode_utf16()
-        .map(|unit| match u8::try_from(unit) {
+    encode_path_str(&path.to_string_lossy())
+}
+
+/// [`encode_project_path`] over the path as text, so a Windows path can be
+/// encoded (and tested) on any platform.
+///
+/// A name longer than 200 units is cut at 200 and suffixed with `-` and the
+/// base-36 absolute value of a 32-bit hash of the whole original path — the
+/// `(h << 5) - h + unit` string hash Claude Code computes over UTF-16 units.
+pub fn encode_path_str(path: &str) -> String {
+    let units: Vec<u16> = path.encode_utf16().collect();
+    let encoded: String = units
+        .iter()
+        .map(|&unit| match u8::try_from(unit) {
             Ok(byte) if byte.is_ascii_alphanumeric() => byte as char,
             _ => '-',
         })
-        .collect()
+        .collect();
+    // One ASCII character per UTF-16 unit, so byte and unit lengths agree.
+    if encoded.len() <= MAX_ENCODED_LENGTH {
+        return encoded;
+    }
+
+    let mut hash: i32 = 0;
+    for &unit in &units {
+        hash = hash
+            .wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit));
+    }
+    // `Math.abs` of i32::MIN is 2147483648, which `unsigned_abs` keeps.
+    format!(
+        "{}-{}",
+        &encoded[..MAX_ENCODED_LENGTH],
+        to_base36(u64::from(hash.unsigned_abs()))
+    )
+}
+
+/// `Number.prototype.toString(36)` for a non-negative integer.
+fn to_base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        digits.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base-36 digits are ASCII")
 }
 
 /// The spelling that encodes to the directory Claude Code created: no trailing
@@ -273,6 +320,46 @@ mod tests {
     #[test]
     fn encodes_by_utf16_unit_not_by_byte() {
         assert_eq!(encode_project_path(Path::new("a-\u{17e}_b")), "a---b");
+    }
+
+    #[test]
+    fn a_long_path_is_cut_and_hashed_like_claude_code_does() {
+        // Ground truth: the directory Claude Code 2.1.326 itself created.
+        let path = "/Users/pablo/sim-mateo/rutalarga/carpeta-con-nombre-muy-largo-01/\
+                    carpeta-con-nombre-muy-largo-02/carpeta-con-nombre-muy-largo-03/\
+                    carpeta-con-nombre-muy-largo-04/carpeta-con-nombre-muy-largo-05/\
+                    carpeta-con-nombre-muy-largo-06/Proyecto_\u{d1}and\u{fa}.v2";
+        assert_eq!(
+            encode_path_str(path),
+            "-Users-pablo-sim-mateo-rutalarga-carpeta-con-nombre-muy-largo-01-\
+             carpeta-con-nombre-muy-largo-02-carpeta-con-nombre-muy-largo-03-\
+             carpeta-con-nombre-muy-largo-04-carpeta-con-nombre-muy-largo-05-carpeta-lxv0h1"
+        );
+    }
+
+    #[test]
+    fn a_path_of_exactly_two_hundred_units_is_left_whole() {
+        let path = format!("/{}", "a".repeat(199));
+        assert_eq!(encode_path_str(&path).len(), 200);
+        assert!(!encode_path_str(&path).contains("a-"));
+        let longer = format!("/{}", "a".repeat(200));
+        assert!(encode_path_str(&longer).len() > 201);
+    }
+
+    #[test]
+    fn the_hash_of_i32_min_is_its_absolute_value() {
+        assert_eq!(to_base36(u64::from(i32::MIN.unsigned_abs())), "zik0zk");
+        assert_eq!(to_base36(0), "0");
+        assert_eq!(to_base36(35), "z");
+        assert_eq!(to_base36(36), "10");
+    }
+
+    #[test]
+    fn a_windows_path_encodes_on_any_platform() {
+        assert_eq!(
+            encode_path_str(r"C:\Users\Mateo\proyectos\jarvis"),
+            "C--Users-Mateo-proyectos-jarvis"
+        );
     }
 
     #[test]
