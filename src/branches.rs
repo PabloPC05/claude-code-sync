@@ -1585,7 +1585,7 @@ mod tests {
         let Repair::Rewritten(fixed) = repair_stale_branch(S, &bytes, "p2", "r2") else {
             panic!("only noise hangs off the old leaf");
         };
-        let expected = vec![
+        let expected = [
             message("p1", None, 0, "hola, revisa el parser"),
             message("p2", Some("p1"), 1, "y los tests"),
             message("r1", Some("p2"), 5, "sigue"),
