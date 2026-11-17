@@ -1289,9 +1289,16 @@ mod tests {
             .into_iter()
             .collect();
         assert!(validate_roots(&relative).is_err());
-        let fine: RootMap = [("proyectos".to_string(), PathBuf::from("/home/x"))]
-            .into_iter()
-            .collect();
+        let fine: RootMap = [(
+            "proyectos".to_string(),
+            PathBuf::from(if cfg!(windows) {
+                r"C:\home\x"
+            } else {
+                "/home/x"
+            }),
+        )]
+        .into_iter()
+        .collect();
         assert!(validate_roots(&fine).is_ok());
     }
 

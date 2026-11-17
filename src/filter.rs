@@ -399,6 +399,16 @@ pub fn pattern_subject(projects_dir: &Path, file: &Path) -> PathBuf {
 
 /// Simple glob pattern matching
 fn glob_match(pattern: &str, text: &str) -> bool {
+    // Windows paths separate with `\`; a pattern written with `/` (as the
+    // docs and every example do) must match them too. The matcher has no
+    // escapes, so `\` means nothing else here.
+    if cfg!(windows) {
+        return glob_match_raw(&pattern.replace('\\', "/"), &text.replace('\\', "/"));
+    }
+    glob_match_raw(pattern, text)
+}
+
+fn glob_match_raw(pattern: &str, text: &str) -> bool {
     // Simple implementation - for production, use the `glob` crate
     if pattern.contains('*') {
         let parts: Vec<_> = pattern.split('*').collect();
