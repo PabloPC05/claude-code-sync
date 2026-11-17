@@ -346,7 +346,13 @@ function Get-SessionEndCommands {
     if ($Settings.Contains('hooks') -and $Settings['hooks'].Contains('SessionEnd')) {
         foreach ($group in @($Settings['hooks']['SessionEnd'])) {
             foreach ($hook in @($group['hooks'])) {
-                $commands.Add([string]$hook['command'])
+                # Exec form (`args` set) runs `command` directly with those
+                # arguments; shell form keeps everything in `command`.
+                $line = [string]$hook['command']
+                if ($hook.Contains('args')) {
+                    $line = (@($line) + @($hook['args'] | ForEach-Object { [string]$_ })) -join ' '
+                }
+                $commands.Add($line)
             }
         }
     }
@@ -355,8 +361,9 @@ function Get-SessionEndCommands {
 
 function Test-OurHook {
     param([string]$Command)
-    $Command.EndsWith('autosync run --detach', [StringComparison]::Ordinal) -and
-    $Command.IndexOf(($script:ExeFull -replace '\\', '/'), [StringComparison]::OrdinalIgnoreCase) -ge 0
+    $normalized = $Command -replace '\\', '/'
+    $normalized.EndsWith('autosync run --detach', [StringComparison]::Ordinal) -and
+    $normalized.IndexOf(($script:ExeFull -replace '\\', '/'), [StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
 function Test-TaskExists {
