@@ -280,6 +280,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_operation_history_add_operation() {
         let (_temp_dir, path) = setup_test_env();
 
@@ -303,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_operation_history_save_load_roundtrip() {
         let (_temp_dir, path) = setup_test_env();
 
@@ -463,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_operation_history_clear() {
         let (_temp_dir, path) = setup_test_env();
 
@@ -536,6 +539,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_error_messages_include_file_paths() {
         let (_temp_dir, path) = setup_test_env();
 
@@ -575,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_from_path_creates_new_when_missing() {
         let (_temp_dir, path) = setup_test_env();
 
@@ -611,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_remove_last_operation_by_type() {
         let (_temp_dir, path) = setup_test_env();
         let mut history = OperationHistory::new();
@@ -661,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_remove_last_operation_by_type_persists() {
         let (_temp_dir, path) = setup_test_env();
         let mut history = OperationHistory::new();
