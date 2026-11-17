@@ -24,7 +24,7 @@ cargo doc --open --no-deps --all-features
 |---------|-------------|
 | **Parallel Branches** | A chat continued on two machines becomes two sessions Claude Code can resume, instead of one file that hides a branch |
 | **Root Map** | Map a projects folder once per machine; every project under it, new ones included, syncs across OSes and user names |
-| **Syncthing mode (`guard`)** | When Syncthing, not git, carries the transcripts: hooks block a prompt typed in a window that is behind, repair what it appends when it closes, and settle `*.sync-conflict-*` copies |
+| **Syncthing mode (`guard`)** | When Syncthing, not git, carries the transcripts: a window that is behind reloads itself on the latest chat and sends what you typed (a `claude` shell function does the reopening), what it appends when it closes is repaired, and `*.sync-conflict-*` copies are settled |
 | **Autosync** | A timer plus a Claude Code `SessionEnd` hook sync on their own, without prompts, one run at a time |
 | **Artifact Sync** | Carry settings, skills, agents, commands, rules, hooks, plugin manifests, plans, todos, and prompt history across machines |
 | **Project Map** | Pin a project to its path per machine, so renamed or relocated checkouts stay one project |
@@ -309,7 +309,7 @@ renames it over the original). Back in A's old window:
 **What the guard does.**
 
 ```bash
-claude-code-sync guard install [--dry-run]   # on each PC
+claude-code-sync guard install [--dry-run] [--no-shell]   # on each PC
 claude-code-sync guard status
 claude-code-sync guard sweep                 # settle every conflict copy now
 claude-code-sync guard uninstall
@@ -321,18 +321,21 @@ claude-code-sync guard uninstall
 alone, and sets `cleanupPeriodDays` to 3650: Claude Code's default deletes
 transcripts after 30 days, and Syncthing would carry those deletions to the
 other PC. Hooks do no network or git work, always exit 0 and say nothing
-unless they block a prompt.
+unless they block a prompt. Unless you pass `--no-shell`, it also installs the
+`claude` shell function described below.
 
 - Each window gets a record in `<config dir>/guard/windows/<pid>.json`: the
   identity of its transcript file (device and inode, or volume serial and file
   index on Windows), its leaf and the uuids it has loaded. Claude's own
   appends never change a file's identity; Syncthing's replacement always does.
 - **Prompt.** If the file was replaced and now holds user or assistant messages
-  the window never loaded, the prompt is blocked and the typed text kept, with
-  the exact command to run: `/resume <id>`. That reloads the chat and
-  `SessionStart` records it again. A replacement that only added metadata (a
-  title, a `last-prompt`) does not block, and neither does a turn the window
-  wrote itself, interrupted with Esc or not.
+  the window never loaded, the prompt does not go through as it is. In a window
+  started through the `claude` function (see below) the window reloads itself;
+  in any other the prompt is blocked with the exact command to run,
+  `/resume <id>`, which reloads the chat (`SessionStart` records it again). A
+  replacement that only added metadata (a title, a `last-prompt`) does not
+  block, and neither does a turn the window wrote itself, interrupted with Esc
+  or not.
 - **Close.** When a window that was behind closes, what it appended off its old
   leaf is taken out: the `/exit` entries are removed, so `claude --continue`
   shows the latest turns again, and real messages it wrote become a
@@ -349,8 +352,72 @@ unless they block a prompt.
   union of both ordered by `timestamp`, and copies of other files stay as they
   are. The result depends only on the two files, so both PCs converge.
 
-`guard status` lists the hooks, the retention, the number of recorded windows
-and the conflict copies still waiting.
+`guard status` lists the hooks, the retention, where the `claude` function is
+installed, the number of recorded windows and the conflict copies still
+waiting.
+
+**Reloading a stale window by itself.** `guard install` puts a shell function
+named `claude` in your shell profiles. It starts the real Claude Code and, if
+the prompt hook closed that window because it was behind, starts it again in
+the same terminal as `claude --resume <id> "<what you typed>"`. You type in the
+stale window, it blinks, comes back with the other PC's turns and your message
+is sent. Nothing else changes: the function adds no flags of its own and
+`claude -p` / `claude --print` run untouched.
+
+- **Where it goes.** Windows: `profile.ps1` of Windows PowerShell
+  (`Documents\WindowsPowerShell`) and of PowerShell 7 (`Documents\PowerShell`),
+  where Documents is the folder Windows reports (OneDrive's, if it redirects
+  it). Elsewhere: `~/.bashrc` and `~/.zshrc`, for the shells that exist (a login
+  shell that only reads `~/.bash_profile`, such as macOS's Terminal with bash,
+  has to source `~/.bashrc` from it). The
+  function sits between the lines `# >>> claude-code-sync guard >>>` and
+  `# <<< claude-code-sync guard <<<`; running `guard install` again replaces it
+  (for instance after the binary moves), `guard uninstall` removes it, and the
+  rest of a file is never touched. It is active in terminals opened after the
+  install.
+- **PowerShell's execution policy.** Windows PowerShell does not load a
+  profile when its execution policy is `Restricted` (the default on Windows
+  client) or `AllSigned`. `guard install` reports the effective policy and, if
+  it blocks profiles, warns you; it never changes it. To allow your own profile:
+
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+  ```
+
+- **What happens when you type in a stale window.** The prompt hook only acts
+  when the Claude it runs in was started by the function (the function names
+  its shell in `CLAUDE_GUARD_SHELL` for that one process) and that Claude is a
+  direct child of that shell, so a Claude started by another Claude, which
+  inherits the variable, never closes anything. It then saves your text and
+  the chat id in `<config dir>/guard/reload/<shell id>.json`, ends the Claude
+  process (SIGTERM, then SIGKILL after 1.5 s; `TerminateProcess` on Windows) and
+  blocks the prompt with a note that the chat is reloading. When Claude returns,
+  the function runs `claude-code-sync guard take-reload`, which consumes that
+  file and prints the new arguments: the options of the original command
+  (`--model`, `--permission-mode`, `--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--add-dir`, `--settings`,
+  `--setting-sources`, `--strict-mcp-config`, `--mcp-config`, `--verbose`,
+  `--agent`, `--ide`, `--chrome`, `--no-chrome`), then `--resume <id>` and your
+  text. `-c`, `--resume`, `--fork-session`, `--session-id` and the original
+  prompt are dropped. The reopened window's `SessionStart` records it, so it is
+  no longer stale. Ending a window abruptly is harmless to the transcript: at
+  most a `last-prompt` and a `cost-state` line get appended. At most 5
+  reloads in a row.
+- **If it does not reload**, the 0.7.0 behaviour is still there: the message
+  says to type `/resume <id>`. That is also what you get in a window started
+  without the function (an old terminal, an IDE's embedded terminal that does
+  not load the profile) or when ending the window fails.
+- **Long messages.** Windows limits the command line, so a message over 8000
+  characters is not passed on it: the window reopens on the chat without it and
+  your text is saved in `<config dir>/guard/reload/last-prompt.txt`.
+- On Windows PowerShell 5.1 (and PowerShell 7 before 7.3) native arguments are
+  passed without escaping quotes, so the function asks `take-reload` to escape
+  them (`--ps-legacy`); `claude.exe` receives your exact text either way.
+
+A shell that is killed mid-run can leave the terminal in raw mode; the bash and
+zsh function runs `stty sane` when it returns. `take-reload` is also usable by
+hand: `claude-code-sync guard take-reload --shell <id> [--ps-legacy] [--format
+json|nul|b64] -- <original args>`.
 
 ### Other changes in this fork
 
@@ -1205,8 +1272,8 @@ transcripts; see [Syncthing mode](#syncthing-mode-guard). None of these needs
 git or `init`.
 
 ```bash
-claude-code-sync guard install --dry-run   # show the settings.json changes
-claude-code-sync guard install
+claude-code-sync guard install --dry-run   # show the settings.json and profile changes
+claude-code-sync guard install             # --no-shell skips the claude function
 claude-code-sync guard status
 claude-code-sync guard sweep               # settle the conflict copies now
 claude-code-sync guard uninstall

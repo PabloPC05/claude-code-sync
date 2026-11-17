@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0 (fork: a stale window reloads itself)
+
+In Syncthing mode, typing in a window that is behind no longer asks you to
+type `/resume <id>` and retype your message: the window closes and reopens
+itself on the latest chat and sends what you typed.
+
+### Features
+
+* **guard:** `guard install` puts a shell function named `claude` in the shell profiles: `profile.ps1` of Windows PowerShell and of PowerShell 7 under the Documents folder (OneDrive's when it redirects it), or `~/.bashrc` and `~/.zshrc` for the shells that exist. It runs the real `claude` with `CLAUDE_GUARD_SHELL` set for that process only (not for `-p`/`--print`) and, when Claude returns, reopens it if the prompt hook asked (at most 5 times in a row). It sits between `# >>> claude-code-sync guard >>>` and `# <<< claude-code-sync guard <<<`: install replaces the block, `guard uninstall` removes it, the rest of the file is never touched (bytes, encoding, byte order mark and line endings are kept). `--no-shell` skips it; `guard status` shows where it is installed; `--dry-run` covers it. On Windows `install` reports PowerShell's effective execution policy and warns, with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, when it is `Restricted` or `AllSigned` (it does not change it)
+* **guard:** when the prompt hook finds a window stale, the Claude is a direct child of the shell named by `CLAUDE_GUARD_SHELL` and it is alive, the hook saves `{session_id, prompt, cwd, created_at}` in `<config dir>/guard/reload/<shell id>.json`, ends that Claude (SIGTERM, SIGKILL after 1.5 s; `TerminateProcess` on Windows) and blocks the prompt with a note that the chat is reloading. A nested Claude inherits the variable but not the parentage, so it never closes anything. If any condition fails, or ending the window fails, the 0.7.0 `/resume <id>` message is used and the request is deleted
+* **guard:** `guard take-reload --shell <id> [--ps-legacy] [--format json|nul|b64] -- <original args>` consumes the request and prints the arguments of the relaunch: a whitelist of the original options (`--model`, `--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--add-dir`, `--settings`, `--setting-sources`, `--strict-mcp-config`, `--mcp-config`, `--verbose`, `--agent`, `--ide`, `--chrome`, `--no-chrome`, also as `--flag=value`), then `--resume <id>` and the typed text. `-c`, `--continue`, `-r`/`--resume`, `--fork-session`, `--session-id` and positional prompts are dropped. A text over 8000 characters is saved in `<config dir>/guard/reload/last-prompt.txt` instead of the command line, and a note on stderr says where. `--ps-legacy` escapes every argument for Windows PowerShell's legacy native-argument passing (the `CommandLineToArgvW` rules) so `claude.exe` receives the exact text. A request nobody took within two minutes is ignored
+
+### Tests
+
+* the wrapper is run by real shells (bash, zsh, pwsh, and Windows PowerShell 5.1 and pwsh in legacy mode on Windows) against a fake `claude` that asks for a reload with a text full of quotes, backslashes, a newline, ñ and an emoji; the second run must receive it exactly
+
 ## 0.7.0 (fork: Syncthing mode)
 
 For two PCs whose `~/.claude/projects` is carried by Syncthing instead of git.
