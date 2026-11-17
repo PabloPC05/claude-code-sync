@@ -34,13 +34,15 @@ function Install-ClaudeCodeSync {
     } catch {
         $osArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     }
-    $arches = switch -Regex ($osArch) {
+    # @() keeps a one-element result an array: unrolled, $arches[0] would be the
+    # first character of 'x86_64' and every x64 install would warn about emulation.
+    $arches = @(switch -Regex ($osArch) {
         '^(X64|AMD64)$' { @('x86_64') }
         # Windows on ARM runs x64 binaries under emulation, so fall back to x86_64
         # for releases that predate the native ARM64 build.
         '^(Arm64|ARM64)$' { @('aarch64', 'x86_64') }
         default { throw "Unsupported architecture: $osArch (prebuilt: x86_64, aarch64). Try: cargo install claude-code-sync" }
-    }
+    })
 
     if ($Version -eq 'latest') {
         $base = "https://github.com/$repo/releases/latest/download"
