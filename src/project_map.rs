@@ -227,7 +227,7 @@ pub fn relative_to_root(root: &str, path: &str) -> Option<String> {
     if is_windows_path(path) != windows {
         return None;
     }
-    if !windows && !(root.starts_with('/') && path.starts_with('/')) {
+    if !(windows || (root.starts_with('/') && path.starts_with('/'))) {
         return None;
     }
     let root_parts = path_components(root, windows);
