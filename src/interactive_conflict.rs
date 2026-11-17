@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::{Confirm, Select};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::conflict::{Conflict, ConflictResolution};
@@ -103,7 +104,7 @@ pub const NONINTERACTIVE_ENV: &str = "CLAUDE_CODE_SYNC_NONINTERACTIVE";
 /// Check if we're running in an interactive terminal
 pub fn is_interactive() -> bool {
     let forbidden = std::env::var_os(NONINTERACTIVE_ENV).is_some_and(|v| !v.is_empty());
-    !forbidden && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+    !forbidden && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Display detailed conflict information
