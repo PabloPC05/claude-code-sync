@@ -180,6 +180,10 @@ pub mod hooks;
 /// carries the transcripts between two PCs.
 pub mod guard;
 
+/// Reloading a stale window on its own: the request the prompt hook leaves,
+/// ending the window, and the arguments of the relaunch (`guard take-reload`).
+pub mod reload;
+
 /// Automatic sync: a timer (LaunchAgent, systemd user timer or Task
 /// Scheduler task) plus a Claude Code `SessionEnd` hook.
 pub mod autosync;

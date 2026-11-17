@@ -20,7 +20,9 @@
 //!   temporary one and renaming it over; Claude's own appends never change
 //!   the identity), its leaf, and every uuid it had loaded;
 //! - `UserPromptSubmit` ([`verdict`]) blocks a prompt when the file was
-//!   replaced and now holds messages the window never saw;
+//!   replaced and now holds messages the window never saw, or, in a window
+//!   the `claude` shell function started, closes it so the function reopens
+//!   the chat with the typed text ([`crate::reload`]);
 //! - `SessionStart` ([`record`]) records what the window loaded;
 //! - `SessionEnd` ([`ended`]) takes what the window appended off its old
 //!   leaf out of the transcript, with the repair a git-mode pull uses;
@@ -1164,10 +1166,25 @@ fn handle(event: Event) -> Result<()> {
 
     match event {
         Event::Prompt => {
-            if let Some(reason) = windows
+            if let Some((pid, reason)) = windows
                 .iter()
-                .find_map(|&pid| verdict(pid, session_id, &transcript))
+                .find_map(|&pid| verdict(pid, session_id, &transcript).map(|r| (pid, r)))
             {
+                // Started by the `claude` wrapper `guard install` puts in
+                // the shell profiles: close this window and let the wrapper
+                // reopen it on the chat. Otherwise, block with /resume.
+                let cwd = text("cwd").map(str::to_string).unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                let reason = crate::reload::stale_response(
+                    pid,
+                    session_id,
+                    text("prompt").unwrap_or(""),
+                    &cwd,
+                    reason,
+                );
                 println!("{}", crate::hooks::block_json(&reason));
             }
         }

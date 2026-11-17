@@ -456,6 +456,35 @@ enum GuardAction {
     /// Settle every Syncthing conflict copy under ~/.claude/projects and
     /// next to history.jsonl
     Sweep,
+
+    /// What the `claude` shell function runs after Claude exits: consume the
+    /// reload request of its shell and print the arguments for the new run
+    /// (nothing when none was asked)
+    TakeReload {
+        /// The id of the shell that runs the wrapper
+        #[arg(long)]
+        shell: u32,
+        /// Escape the arguments for Windows PowerShell's legacy native
+        /// argument passing
+        #[arg(long)]
+        ps_legacy: bool,
+        /// How to print the arguments
+        #[arg(long, value_enum, default_value = "json")]
+        format: ReloadFormat,
+        /// The arguments `claude` was started with
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReloadFormat {
+    /// A JSON array of strings
+    Json,
+    /// Each argument followed by a NUL byte
+    Nul,
+    /// One line per argument: its UTF-8 bytes in base64
+    B64,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -609,6 +638,21 @@ fn main() -> Result<()> {
             GuardAction::Uninstall { dry_run } => claude_code_sync::guard::uninstall(*dry_run),
             GuardAction::Status => claude_code_sync::guard::status(),
             GuardAction::Sweep => claude_code_sync::guard::sweep(),
+            GuardAction::TakeReload {
+                shell,
+                ps_legacy,
+                format,
+                args,
+            } => claude_code_sync::reload::take_reload_command(
+                *shell,
+                *ps_legacy,
+                match format {
+                    ReloadFormat::Json => claude_code_sync::reload::Format::Json,
+                    ReloadFormat::Nul => claude_code_sync::reload::Format::Nul,
+                    ReloadFormat::B64 => claude_code_sync::reload::Format::B64,
+                },
+                args,
+            ),
         };
     }
 

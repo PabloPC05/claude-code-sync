@@ -30,6 +30,9 @@ use std::path::{Path, PathBuf};
 /// Code's. For tests.
 pub const HOOK_PID_ENV: &str = "CLAUDE_CODE_SYNC_HOOK_PID";
 
+/// Tests only: what [`parent_of`] answers, whatever the process asked about.
+pub const HOOK_SHELL_PARENT_ENV: &str = "CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT";
+
 /// One chat whose open windows are behind the transcript on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
@@ -398,22 +401,23 @@ fn ancestors_of_this_process() -> Vec<u32> {
     found
 }
 
+/// pid -> parent pid for every process, from one snapshot of the process
+/// table.
 #[cfg(windows)]
-fn ancestors_of_this_process() -> Vec<u32> {
+fn process_table() -> std::collections::HashMap<u32, u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
 
-    // pid -> parent pid, from one snapshot of the process table.
-    let mut table: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut table = std::collections::HashMap::new();
     // SAFETY: the snapshot handle is checked and closed; the entry is a
     // plain struct whose size field is set before the calls that read it.
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return Vec::new();
+            return table;
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -424,6 +428,12 @@ fn ancestors_of_this_process() -> Vec<u32> {
         }
         CloseHandle(snapshot);
     }
+    table
+}
+
+#[cfg(windows)]
+fn ancestors_of_this_process() -> Vec<u32> {
+    let table = process_table();
     let mut found = Vec::new();
     let mut current = std::process::id();
     for _ in 0..2 {
@@ -436,6 +446,46 @@ fn ancestors_of_this_process() -> Vec<u32> {
         }
     }
     found
+}
+
+/// The parent process of `pid`, if it can be told. The reload checks that
+/// the Claude window's parent is the shell that started it.
+/// `CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT` replaces the answer (tests).
+pub fn parent_of(pid: u32) -> Option<u32> {
+    if let Some(parent) = std::env::var(HOOK_SHELL_PARENT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        return Some(parent);
+    }
+    real_parent_of(pid)
+}
+
+#[cfg(unix)]
+fn real_parent_of(pid: u32) -> Option<u32> {
+    std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        .filter(|&parent| parent > 0)
+}
+
+#[cfg(windows)]
+fn real_parent_of(pid: u32) -> Option<u32> {
+    process_table().get(&pid).copied().filter(|&p| p > 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn real_parent_of(_pid: u32) -> Option<u32> {
+    None
 }
 
 #[cfg(not(any(unix, windows)))]
