@@ -350,7 +350,7 @@ pub fn mapped_repo_dir_name(
     if roots.is_empty() {
         return None;
     }
-    let path = project_path_from_transcripts(&projects_dir.join(encoded_dir), encoded_dir)?;
+    let path = project_path_from_transcripts(&projects_dir.join(encoded_dir), encoded_dir, &roots)?;
     root_repo_dir_name(&roots, &path)
 }
 
@@ -358,10 +358,20 @@ pub fn mapped_repo_dir_name(
 /// transcripts records that encodes back to the directory's name. A session
 /// that changed directory records other `cwd`s as well; those are skipped.
 ///
+/// A project that has only been pulled here so far records another
+/// machine's paths, none of which encodes to this directory. Then each
+/// recorded path's trailing components are tried under each of this
+/// machine's roots — the part below a root is what both machines share —
+/// and a candidate whose encoding is exactly the directory's name is it.
+///
 /// Answers are remembered for the life of the process, since discovery asks
 /// once per file in a directory: a found path for good (a directory's name
 /// pins its path), a miss until the directory's transcripts change.
-pub fn project_path_from_transcripts(project_dir: &Path, encoded_dir: &str) -> Option<String> {
+pub fn project_path_from_transcripts(
+    project_dir: &Path,
+    encoded_dir: &str,
+    roots: &RootMap,
+) -> Option<String> {
     use std::io::BufRead;
 
     type Lookup = BTreeMap<PathBuf, Result<String, (usize, u64)>>;
@@ -390,7 +400,7 @@ pub fn project_path_from_transcripts(project_dir: &Path, encoded_dir: &str) -> O
         return None;
     }
 
-    let mut rejected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut recorded: Vec<String> = Vec::new();
     let mut found = None;
     'transcripts: for (transcript, _) in &transcripts {
         let Ok(file) = std::fs::File::open(transcript) else {
@@ -407,22 +417,43 @@ pub fn project_path_from_transcripts(project_dir: &Path, encoded_dir: &str) -> O
             let Some(cwd) = entry.get("cwd").and_then(|cwd| cwd.as_str()) else {
                 continue;
             };
-            if rejected.contains(cwd) {
+            if recorded.iter().any(|seen| seen == cwd) {
                 continue;
             }
             if encode_path_str(cwd) == encoded_dir {
                 found = Some(cwd.to_string());
                 break 'transcripts;
             }
-            rejected.insert(cwd.to_string());
+            recorded.push(cwd.to_string());
         }
     }
+    let found = found.or_else(|| path_under_a_root(&recorded, roots, encoded_dir));
 
     if let Ok(mut lookups) = lookups.lock() {
         let answer = found.clone().ok_or(fingerprint);
         lookups.insert(project_dir.to_path_buf(), answer);
     }
     found
+}
+
+/// The path under one of `roots` that a recorded `cwd`'s trailing
+/// components make and that encodes to `encoded_dir`, longest first.
+fn path_under_a_root(recorded: &[String], roots: &RootMap, encoded_dir: &str) -> Option<String> {
+    for cwd in recorded {
+        let parts = path_components(cwd, is_windows_path(cwd));
+        for root in roots.values() {
+            let root = root.to_string_lossy();
+            for start in 0..=parts.len() {
+                let Some(candidate) = root_project_path(&root, &parts[start..].join("/")) else {
+                    continue;
+                };
+                if encode_path_str(&candidate) == encoded_dir {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The directory name a local encoded project directory takes in the sync
@@ -1180,6 +1211,26 @@ mod tests {
             repo_dir_name_in(&filter, projects.path(), "-home-mateo-proyectos-empty"),
             "-home-mateo-proyectos-empty",
             "without a transcript the encoded name stays"
+        );
+    }
+
+    #[test]
+    fn a_project_only_pulled_so_far_is_placed_under_this_machines_root() {
+        // The transcripts came from a Windows machine; nothing here has
+        // recorded this machine's own path yet.
+        let projects = tempfile::TempDir::new().unwrap();
+        let encoded = "-home-mateo-proyectos-clientes-acme";
+        std::fs::create_dir_all(projects.path().join(encoded)).unwrap();
+        std::fs::write(
+            projects.path().join(encoded).join("s1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:\\\\Users\\\\Mateo\\\\proyectos\\\\clientes\\\\acme\"}\n",
+        )
+        .unwrap();
+        let filter = rooted(&[("proyectos", "/home/mateo/proyectos")]);
+
+        assert_eq!(
+            repo_dir_name_in(&filter, projects.path(), encoded),
+            "@proyectos@clientes%2Facme"
         );
     }
 
