@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased (fork: roots, parallel branches, autosync)
+## 0.5.0 (fork: roots, parallel branches, autosync)
 
-Fork of perfectra1n/claude-code-sync v0.4.1.
+First release of the fork [PabloPC05/claude-code-sync](https://github.com/PabloPC05/claude-code-sync),
+based on perfectra1n/claude-code-sync v0.4.1. The install scripts, `self-update`
+and cargo-binstall now fetch this fork's releases.
 
 ### Features
 
@@ -17,6 +19,9 @@ Fork of perfectra1n/claude-code-sync v0.4.1.
 * **project_map:** a project only pulled so far is pushed back under its root name, not duplicated under the local encoded name
 * **filter:** include/exclude patterns apply to a project's attachments, session sidecar directories and memory, in push, pull, status and purge; excluded projects are not reported for size
 * **merge:** a smart-merged transcript ends with the `last-prompt` of its most recent branch, so resume continues the newest one
+* **push:** a transcript whose repository copy holds entries this machine lacks (a session live here, or one not pulled yet) is held back instead of pushed over them
+* **autosync:** the `SessionEnd` hook uses Claude Code's exec form (no shell), so it also works where hooks run under PowerShell
+* **pull:** the summary counts only diverged transcripts as conflicts
 
 ## [0.4.1](https://github.com/perfectra1n/claude-code-sync/compare/v0.4.0...v0.4.1) (2026-10-10)
 
