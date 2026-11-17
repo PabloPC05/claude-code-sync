@@ -93,6 +93,32 @@ pub struct MergeStats {
     pub timestamp_merged: usize,
 }
 
+/// Move the `last-prompt` records to the end, ordered by when the entry each
+/// one names (`leafUuid`) was written.
+///
+/// Claude Code resumes from the leaf the file's last `last-prompt` record
+/// names. Those records carry no timestamp, so the sort by timestamp puts
+/// them first and an arbitrary one ends up deciding; this makes the most
+/// recently written branch the one a resume continues.
+fn last_prompts_last(entries: Vec<ConversationEntry>) -> Vec<ConversationEntry> {
+    let written_at: HashMap<String, Option<String>> = entries
+        .iter()
+        .filter_map(|e| e.uuid.clone().map(|uuid| (uuid, e.timestamp.clone())))
+        .collect();
+    let (mut prompts, mut rest): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|e| e.entry_type == "last-prompt");
+    prompts.sort_by_key(|prompt| {
+        prompt
+            .extra
+            .get("leafUuid")
+            .and_then(|leaf| leaf.as_str())
+            .and_then(|leaf| written_at.get(leaf).cloned().flatten())
+    });
+    rest.extend(prompts);
+    rest
+}
+
 /// Smart merger for combining conversation sessions
 pub struct SmartMerger<'a> {
     local: &'a [ConversationEntry],
@@ -166,6 +192,7 @@ impl<'a> SmartMerger<'a> {
             let b_ts = b.timestamp.as_ref();
             a_ts.cmp(&b_ts)
         });
+        let merged_entries = last_prompts_last(merged_entries);
 
         self.stats.merged_messages = merged_entries.len();
 
@@ -736,5 +763,68 @@ mod tests {
             result.merged_entries[0].message,
             Some(json!({"text": "Remote version (newer)"}))
         );
+    }
+    #[test]
+    fn a_merged_transcript_resumes_from_its_most_recent_branch() {
+        let entry =
+            |kind: &str, uuid: Option<&str>, parent: Option<&str>, ts: Option<&str>, extra| {
+                ConversationEntry {
+                    entry_type: kind.to_string(),
+                    uuid: uuid.map(str::to_string),
+                    parent_uuid: parent.map(str::to_string),
+                    session_id: Some("s".to_string()),
+                    timestamp: ts.map(str::to_string),
+                    message: None,
+                    cwd: None,
+                    version: None,
+                    git_branch: None,
+                    extra,
+                }
+            };
+        let prompt = |leaf: &str| {
+            entry(
+                "last-prompt",
+                None,
+                None,
+                None,
+                serde_json::json!({ "leafUuid": leaf }),
+            )
+        };
+        let root = entry(
+            "user",
+            Some("p"),
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            serde_json::Value::Null,
+        );
+        let local = vec![
+            root.clone(),
+            entry(
+                "user",
+                Some("late"),
+                Some("p"),
+                Some("2026-01-01T00:09:00Z"),
+                serde_json::Value::Null,
+            ),
+            prompt("late"),
+        ];
+        let remote = vec![
+            root,
+            entry(
+                "user",
+                Some("early"),
+                Some("p"),
+                Some("2026-01-01T00:05:00Z"),
+                serde_json::Value::Null,
+            ),
+            prompt("early"),
+        ];
+
+        for (one, other) in [(&local, &remote), (&remote, &local)] {
+            let merged = SmartMerger::new(one, other).merge().unwrap().merged_entries;
+            let last = merged.last().unwrap();
+            assert_eq!(last.entry_type, "last-prompt");
+            assert_eq!(last.extra["leafUuid"], "late");
+        }
     }
 }

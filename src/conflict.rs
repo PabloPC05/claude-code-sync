@@ -164,6 +164,14 @@ pub enum ConflictResolution {
     /// local version. The local file will be overwritten with the remote content.
     KeepRemote,
 
+    /// Settled by entry without asking: fast-forwarded, kept, combined, or
+    /// split into a parallel branch (see `crate::branches`). `outcome` says
+    /// which, in words.
+    Reconciled {
+        /// What was done, for the report.
+        outcome: String,
+    },
+
     /// The conflict has not yet been resolved.
     ///
     /// This is the default state for newly detected conflicts. The user must choose

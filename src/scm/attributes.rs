@@ -33,6 +33,43 @@ pub fn ensure_sync_attributes(repo_path: &Path) -> Result<bool> {
     ensure_lines(&repo_path.join(".gitattributes"), &rules)
 }
 
+/// The rule that takes session transcripts out of the union merge:
+/// `<sync_subdirectory>/*/*.jsonl -merge`, later than `*.jsonl merge=union`
+/// and so overriding it.
+///
+/// Two machines that both continued one session must not have their lines
+/// interleaved into one file: Claude Code would show only the latest
+/// branch, and the other machine's messages would vanish from view. With
+/// the rule, git reports the file as a conflict instead, and the pull
+/// settles it the way it settles any diverged transcript (see
+/// `crate::branches`). Subagent transcripts, one level deeper, and the
+/// prompt history keep the union merge.
+///
+/// `None` for a subdirectory a pattern cannot spell plainly.
+pub fn transcript_rule(sync_subdirectory: &str) -> Option<String> {
+    let subdirectory = sync_subdirectory.replace('\\', "/");
+    let subdirectory = subdirectory.trim_matches('/');
+    let plain = !subdirectory.is_empty()
+        && !subdirectory.starts_with(['!', '#'])
+        && !subdirectory
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '*' | '?' | '[' | ']' | '"' | '\\'));
+    plain.then(|| format!("{subdirectory}/*/*.jsonl -merge"))
+}
+
+/// Write [`transcript_rule`] into the repository's `.gitattributes`.
+/// Returns whether anything was added.
+pub fn ensure_transcript_rule(repo_path: &Path, sync_subdirectory: &str) -> Result<bool> {
+    let Some(rule) = transcript_rule(sync_subdirectory) else {
+        log::warn!(
+            "sync_subdirectory {sync_subdirectory:?} cannot be written as a .gitattributes \
+             pattern; transcripts two machines changed stay union-merged by git"
+        );
+        return Ok(false);
+    };
+    ensure_lines(&repo_path.join(".gitattributes"), &[rule])
+}
+
 /// Append every line that the file does not already contain, creating it if
 /// needed. Returns whether the file changed.
 pub fn ensure_lines(path: &Path, lines: &[String]) -> Result<bool> {
@@ -85,6 +122,46 @@ mod tests {
             fs::read_to_string(repo.path().join(".gitattributes")).unwrap(),
             written
         );
+    }
+
+    #[test]
+    fn transcripts_leave_the_union_merge_and_subagents_stay_in_it() {
+        assert_eq!(
+            transcript_rule("projects").as_deref(),
+            Some("projects/*/*.jsonl -merge")
+        );
+        assert_eq!(
+            transcript_rule("a/b/").as_deref(),
+            Some("a/b/*/*.jsonl -merge")
+        );
+        assert_eq!(transcript_rule("my projects"), None);
+        assert_eq!(transcript_rule("*"), None);
+
+        let repo = TempDir::new().unwrap();
+        ensure_sync_attributes(repo.path()).unwrap();
+        assert!(ensure_transcript_rule(repo.path(), "projects").unwrap());
+        assert!(!ensure_transcript_rule(repo.path(), "projects").unwrap());
+        let written = fs::read_to_string(repo.path().join(".gitattributes")).unwrap();
+        let union = written.find("*.jsonl merge=union").unwrap();
+        let unset = written.find("projects/*/*.jsonl -merge").unwrap();
+        assert!(union < unset, "the later line wins in .gitattributes");
+
+        let check = |path: &str| {
+            let output = std::process::Command::new("git")
+                .args(["check-attr", "merge", "--", path])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(check("projects/p/s.jsonl").ends_with("merge: unset\n"));
+        assert!(check("projects/p/s/subagents/a.jsonl").ends_with("merge: union\n"));
+        assert!(check("artifacts/prompt-history/history.jsonl").ends_with("merge: union\n"));
     }
 
     #[test]

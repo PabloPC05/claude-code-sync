@@ -9,6 +9,9 @@ use crate::parser::ConversationSession;
 /// Resolution action chosen by the user
 #[derive(Debug, Clone)]
 pub enum ResolutionAction {
+    /// Keep both continuations as separate sessions (default for a session
+    /// continued on both machines)
+    ParallelBranch,
     /// Intelligently merge both versions (default/recommended)
     SmartMerge,
     /// Keep the local version and discard the remote changes
@@ -24,6 +27,12 @@ pub enum ResolutionAction {
 impl std::fmt::Display for ResolutionAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResolutionAction::ParallelBranch => {
+                write!(
+                    f,
+                    "parallel branch (the later continuation becomes its own session)"
+                )
+            }
             ResolutionAction::SmartMerge => write!(f, "smart merge"),
             ResolutionAction::KeepLocal => write!(f, "local"),
             ResolutionAction::KeepRemote => write!(f, "remote"),
@@ -36,6 +45,8 @@ impl std::fmt::Display for ResolutionAction {
 /// Result of interactive conflict resolution
 #[derive(Debug)]
 pub struct ResolutionResult {
+    /// Sessions to split into parallel branches (applied by the pull)
+    pub parallel_branch: Vec<Conflict>,
     /// Conflicts resolved via smart merge
     pub smart_merge: Vec<Conflict>,
     /// Conflicts that should keep local version (discard remote)
@@ -56,6 +67,7 @@ impl ResolutionResult {
     /// Creates a new empty ResolutionResult with all conflict vectors initialized
     pub fn new() -> Self {
         ResolutionResult {
+            parallel_branch: Vec::new(),
             smart_merge: Vec::new(),
             keep_local: Vec::new(),
             keep_remote: Vec::new(),
@@ -63,10 +75,21 @@ impl ResolutionResult {
         }
     }
 
+    /// Every conflict, with the resolution chosen for it.
+    pub fn all(&self) -> impl Iterator<Item = &Conflict> {
+        self.parallel_branch
+            .iter()
+            .chain(&self.smart_merge)
+            .chain(&self.keep_local)
+            .chain(&self.keep_remote)
+            .chain(&self.keep_both)
+    }
+
     /// Total number of conflicts resolved
     #[allow(dead_code)]
     pub fn total(&self) -> usize {
-        self.smart_merge.len()
+        self.parallel_branch.len()
+            + self.smart_merge.len()
             + self.keep_local.len()
             + self.keep_remote.len()
             + self.keep_both.len()
@@ -138,19 +161,27 @@ fn display_conflict_details(conflict: &Conflict) {
     println!("{}", "=".repeat(80).cyan());
 }
 
-/// Interactively resolve a single conflict
-fn resolve_conflict_interactive(conflict: &Conflict) -> Result<ResolutionAction> {
+/// Interactively resolve a single conflict. `offer_branch` puts the
+/// parallel branch first, for a session continued on both machines.
+fn resolve_conflict_interactive(
+    conflict: &Conflict,
+    offer_branch: bool,
+) -> Result<ResolutionAction> {
     loop {
         println!("\n{}", "Conflict Detected!".yellow().bold());
         println!("  {}", conflict.description().dimmed());
 
-        let options = vec![
+        let mut options = Vec::new();
+        if offer_branch {
+            options.push(ResolutionAction::ParallelBranch);
+        }
+        options.extend([
             ResolutionAction::SmartMerge,
             ResolutionAction::KeepLocal,
             ResolutionAction::KeepRemote,
             ResolutionAction::KeepBoth,
             ResolutionAction::ViewDetails,
-        ];
+        ]);
 
         let action = Select::new("Resolve:", options)
             .prompt()
@@ -184,6 +215,25 @@ pub fn resolve_conflicts_interactive_with_sessions(
     local_sessions: Option<&std::collections::HashMap<String, &ConversationSession>>,
     remote_sessions: Option<&std::collections::HashMap<String, &ConversationSession>>,
 ) -> Result<ResolutionResult> {
+    resolve_interactively(conflicts, local_sessions, remote_sessions, false)
+}
+
+/// [`resolve_conflicts_interactive_with_sessions`] for sessions continued on
+/// both machines: the parallel branch is offered first.
+pub fn resolve_transcript_conflicts_interactive(
+    conflicts: &mut [Conflict],
+    local_sessions: &std::collections::HashMap<String, &ConversationSession>,
+    remote_sessions: &std::collections::HashMap<String, &ConversationSession>,
+) -> Result<ResolutionResult> {
+    resolve_interactively(conflicts, Some(local_sessions), Some(remote_sessions), true)
+}
+
+fn resolve_interactively(
+    conflicts: &mut [Conflict],
+    local_sessions: Option<&std::collections::HashMap<String, &ConversationSession>>,
+    remote_sessions: Option<&std::collections::HashMap<String, &ConversationSession>>,
+    offer_branch: bool,
+) -> Result<ResolutionResult> {
     if conflicts.is_empty() {
         return Ok(ResolutionResult::new());
     }
@@ -208,9 +258,13 @@ pub fn resolve_conflicts_interactive_with_sessions(
             total_conflicts.to_string().cyan()
         );
 
-        let action = resolve_conflict_interactive(conflict)?;
+        let action = resolve_conflict_interactive(conflict, offer_branch)?;
 
         match action {
+            ResolutionAction::ParallelBranch => {
+                println!("  {} Keeping both continuations as sessions", "✓".cyan());
+                result.parallel_branch.push(conflict.clone());
+            }
             ResolutionAction::SmartMerge => {
                 // Attempt smart merge
                 if let (Some(local_map), Some(remote_map)) = (local_sessions, remote_sessions) {
@@ -282,6 +336,12 @@ pub fn resolve_conflicts_interactive_with_sessions(
     println!("\n{}", "=".repeat(80).green());
     println!("{}", "Resolution Summary".bold().green());
     println!("{}", "=".repeat(80).green());
+    if offer_branch {
+        println!(
+            "  Parallel Branch: {}",
+            result.parallel_branch.len().to_string().cyan()
+        );
+    }
     println!(
         "  Smart Merge: {}",
         result.smart_merge.len().to_string().cyan()

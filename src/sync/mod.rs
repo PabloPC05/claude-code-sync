@@ -106,11 +106,15 @@ fn describe_change_counts(counts: &CategoryCounts) -> String {
 pub(crate) fn commit_sync_attributes(
     repo: &dyn crate::scm::Scm,
     repo_path: &std::path::Path,
+    sync_subdirectory: &str,
 ) -> Result<()> {
     if repo.has_changes()? {
         return Ok(());
     }
-    if !crate::scm::attributes::ensure_sync_attributes(repo_path)? {
+    let added_rules = crate::scm::attributes::ensure_sync_attributes(repo_path)?;
+    let added_transcript_rule =
+        crate::scm::attributes::ensure_transcript_rule(repo_path, sync_subdirectory)?;
+    if !added_rules && !added_transcript_rule {
         return Ok(());
     }
 
@@ -263,7 +267,7 @@ mod tests {
         repo.stage_all().unwrap();
         repo.commit("written by an older version").unwrap();
 
-        commit_sync_attributes(repo.as_ref(), repo_path).unwrap();
+        commit_sync_attributes(repo.as_ref(), repo_path, "projects").unwrap();
 
         let stored_hook = git_output(repo_path, &["show", "HEAD:hook.sh"]);
         let commit_count = git_output(repo_path, &["rev-list", "--count", "HEAD"]);

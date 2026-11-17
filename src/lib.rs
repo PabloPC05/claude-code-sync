@@ -44,6 +44,12 @@ pub enum VerbosityLevel {
 // `artifacts` documents itself in artifacts/mod.rs.
 pub mod artifacts;
 
+/// Parallel branches: settling a transcript two machines both continued.
+///
+/// Fast-forwards, keeps, or splits the losing continuation into a session
+/// of its own, deterministically, so both machines converge.
+pub mod branches;
+
 /// SHA-256 digests, hex-encoded: the one helper every hashing caller uses.
 pub mod digest;
 

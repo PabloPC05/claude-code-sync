@@ -125,6 +125,7 @@ impl ConflictReport {
                     }
                     ConflictResolution::KeepLocal => "Keep local".to_string(),
                     ConflictResolution::KeepRemote => "Keep remote".to_string(),
+                    ConflictResolution::Reconciled { outcome } => outcome.clone(),
                     ConflictResolution::Pending => "Pending".to_string(),
                 },
             })

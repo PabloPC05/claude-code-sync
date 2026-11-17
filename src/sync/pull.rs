@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Confirm;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::conflict::ConflictDetector;
+use crate::branches::{Reconciled, Side};
+use crate::conflict::{ConflictDetector, ConflictResolution};
 use crate::filter::FilterConfig;
 use crate::history::{
     ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
@@ -45,11 +46,236 @@ fn local_destination(
     Some(local_project_dir.join(inside_project))
 }
 
+/// A resolution saying how a transcript was reconciled.
+fn reconciled(outcome: &str) -> ConflictResolution {
+    ConflictResolution::Reconciled {
+        outcome: outcome.to_string(),
+    }
+}
+
+/// How the transcripts that differed were settled, for the summary.
+#[derive(Debug, Default)]
+struct TranscriptCounts {
+    fast_forwarded: usize,
+    kept_local: usize,
+    combined: usize,
+    branched: usize,
+}
+
+/// Writes what reconciling transcripts decides, and remembers it: which
+/// files it wrote (the pass over non-conflicting sessions settles against
+/// those instead of overwriting them) and which live sessions it left alone.
+struct BranchWriter<'a> {
+    live: &'a HashSet<String>,
+    written: HashSet<PathBuf>,
+    deferred: BTreeSet<String>,
+    counts: TranscriptCounts,
+}
+
+impl<'a> BranchWriter<'a> {
+    fn new(live: &'a HashSet<String>) -> Self {
+        BranchWriter {
+            live,
+            written: HashSet::new(),
+            deferred: BTreeSet::new(),
+            counts: TranscriptCounts::default(),
+        }
+    }
+
+    /// Whether the file (relative to the projects directory) belongs to a
+    /// session running here; if so it is remembered as deferred.
+    fn defer_if_live(&mut self, relative: &Path) -> bool {
+        match crate::branches::owning_session_id(relative) {
+            Some(session) if self.live.contains(session) => {
+                self.deferred.insert(session.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+        crate::branches::write_file(path, bytes)?;
+        self.written.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Settle a repository transcript against a local file this pull
+    /// already wrote. Returns whether the file changed.
+    fn settle_branch(&mut self, path: &Path, session_id: &str, remote: &[u8]) -> Result<bool> {
+        let live = self.live;
+        let mut deferred = Vec::new();
+        let written = crate::branches::write_branch(
+            path,
+            session_id,
+            remote,
+            &|id| live.contains(id),
+            &mut deferred,
+        )?;
+        self.deferred.extend(deferred);
+        let changed = !written.is_empty();
+        self.written.extend(written);
+        Ok(changed)
+    }
+
+    /// Split a session both machines continued: the winner's file stays
+    /// `session_id`, the loser's becomes the session `branch_id` beside it,
+    /// with a copy of the session's sidecar directory.
+    fn split(
+        &mut self,
+        conflict: &mut crate::conflict::Conflict,
+        session_id: &str,
+        winner: Side,
+        branch_id: &str,
+        branch: &[u8],
+        remote_bytes: &[u8],
+    ) -> Result<()> {
+        let local_project = conflict.local_file.parent().unwrap_or(Path::new("."));
+        let remote_project = conflict.remote_file.parent().unwrap_or(Path::new("."));
+        if winner == Side::Remote {
+            self.write(&conflict.local_file, remote_bytes)?;
+        }
+
+        let branch_path = local_project.join(format!("{branch_id}.jsonl"));
+        self.settle_branch(&branch_path, branch_id, branch)?;
+
+        // The branch's sidecar: the losing side's files first. What the
+        // repository already holds for the branch arrives with this pull.
+        let local_sidecar = local_project.join(session_id);
+        let remote_sidecar = remote_project.join(session_id);
+        let sources = match winner {
+            Side::Remote => [local_sidecar.as_path(), remote_sidecar.as_path()],
+            Side::Local => [remote_sidecar.as_path(), local_sidecar.as_path()],
+        };
+        let remote_branch_sidecar = remote_project.join(branch_id);
+        let copied = crate::branches::copy_sidecars(
+            &sources,
+            &local_project.join(branch_id),
+            &|relative| remote_branch_sidecar.join(relative).exists(),
+        )?;
+        self.written.extend(copied);
+
+        let loser = match winner {
+            Side::Local => "remote",
+            Side::Remote => "local",
+        };
+        println!(
+            "  {} {} was continued on both machines: the {loser} continuation is now session {}",
+            "⑂".cyan(),
+            session_id,
+            branch_id.cyan()
+        );
+        conflict.resolution = reconciled(&format!(
+            "parallel branch: the {loser} continuation is now session {branch_id}"
+        ));
+        self.counts.branched += 1;
+        Ok(())
+    }
+
+    fn print_counts(&self) {
+        let counts = &self.counts;
+        if counts.fast_forwarded + counts.kept_local + counts.combined + counts.branched == 0 {
+            return;
+        }
+        println!(
+            "  {} Transcripts: {} fast-forwarded, {} kept local, {} combined, {} parallel branch(es)",
+            "✓".green(),
+            counts.fast_forwarded,
+            counts.kept_local,
+            counts.combined,
+            counts.branched
+        );
+    }
+
+    /// Said at every verbosity: a deferred session is a sync not yet done.
+    fn print_deferred(&self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        println!(
+            "  {} Deferred {} live session(s); they sync once closed",
+            "⏸".yellow(),
+            self.deferred.len()
+        );
+        log::info!(
+            "Deferred live sessions: {}",
+            self.deferred.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+/// A transcript both sides of a sync-repository merge changed: settled the
+/// way a pull settles it, so the repository never holds two machines'
+/// continuations interleaved in one file. The losing continuation is
+/// written beside it as its own session, for the next push to commit.
+///
+/// `None` for anything that is not a session transcript in the projects
+/// directory, or that one side deleted: those keep their usual handling.
+fn settle_transcript_conflict(
+    file: &scm::ConflictedFile,
+    repo_root: &Path,
+    filter: &FilterConfig,
+) -> Result<Option<scm::ConflictChoice>> {
+    let (Some(local), Some(remote)) = (&file.local, &file.remote) else {
+        return Ok(None);
+    };
+    let Ok(relative) = Path::new(&file.path).strip_prefix(&filter.sync_subdirectory) else {
+        return Ok(None);
+    };
+    let Some(session_id) = crate::branches::top_level_session_id(relative) else {
+        return Ok(None);
+    };
+    let project_dir = repo_root
+        .join(&filter.sync_subdirectory)
+        .join(relative.parent().unwrap_or(Path::new("")));
+
+    let merged = match crate::branches::reconcile(session_id, local, remote) {
+        Reconciled::Same | Reconciled::KeepLocal => local.clone(),
+        Reconciled::TakeRemote => remote.clone(),
+        Reconciled::Combined(bytes) => bytes,
+        Reconciled::Split {
+            winner,
+            branch_id,
+            branch,
+        } => {
+            let mut deferred = Vec::new();
+            crate::branches::write_branch(
+                &project_dir.join(format!("{branch_id}.jsonl")),
+                &branch_id,
+                &branch,
+                &|_| false,
+                &mut deferred,
+            )?;
+            crate::branches::copy_sidecars(
+                &[&project_dir.join(session_id)],
+                &project_dir.join(&branch_id),
+                &|_| false,
+            )?;
+            println!(
+                "  {} {}: continued on both machines, split into a parallel branch {}",
+                "⑂".cyan(),
+                file.path,
+                branch_id
+            );
+            match winner {
+                Side::Local => local.clone(),
+                Side::Remote => remote.clone(),
+            }
+        }
+    };
+    Ok(Some(scm::ConflictChoice::WriteMerged(merged)))
+}
+
 fn settle_conflict(
     file: &scm::ConflictedFile,
     can_ask: bool,
     filter: &FilterConfig,
+    repo_root: &Path,
 ) -> Result<scm::ConflictChoice> {
+    if let Some(choice) = settle_transcript_conflict(file, repo_root, filter)? {
+        return Ok(choice);
+    }
+
     let differing_only_in_dates = match (&file.local, &file.remote) {
         (Some(local), Some(remote)) => keep_later_timestamps(local, remote),
         _ => None,
@@ -100,7 +326,11 @@ pub fn pull_history(
         .or_else(|| repo.current_branch().ok())
         .unwrap_or_else(|| "main".to_string());
 
-    super::commit_sync_attributes(repo.as_ref(), &state.sync_repo_path)?;
+    super::commit_sync_attributes(
+        repo.as_ref(),
+        &state.sync_repo_path,
+        &filter.sync_subdirectory,
+    )?;
 
     // Fetch from remote if configured
     if fetch_remote && state.has_remote {
@@ -111,7 +341,7 @@ pub fn pull_history(
         // remote that cannot be reached or reconciled stops the pull instead.
         let resolve_conflict = |file: &scm::ConflictedFile| {
             let can_ask = interactive_conflict::is_interactive();
-            settle_conflict(file, can_ask, &filter)
+            settle_conflict(file, can_ask, &filter, &state.sync_repo_path)
         };
         repo.pull("origin", &branch_name, &resolve_conflict)
             .context(
@@ -124,8 +354,15 @@ pub fn pull_history(
 
         // A first pull into a repository with no commits of its own sets the
         // uncommitted rules aside; restore and commit them now.
-        super::commit_sync_attributes(repo.as_ref(), &state.sync_repo_path)?;
+        super::commit_sync_attributes(
+            repo.as_ref(),
+            &state.sync_repo_path,
+            &filter.sync_subdirectory,
+        )?;
     }
+
+    // Sessions running here now: their transcripts are not rewritten.
+    let live_sessions = crate::branches::live_session_ids(&claude_home_dir()?);
 
     // Discover local sessions
     println!("  {} local sessions...", "Discovering".cyan());
@@ -414,25 +651,26 @@ pub fn pull_history(
     // ============================================================================
     // Track affected conversations for operation record
     let mut affected_conversations: Vec<ConversationSummary> = Vec::new();
+    let mut branches = BranchWriter::new(&live_sessions);
 
     if detector.has_conflicts() {
         println!(
-            "  {} {} conflicts detected",
+            "  {} {} transcript(s) differ from the sync repository",
             "!".yellow(),
             detector.conflict_count()
         );
-
-        // ============================================================================
-        // ATTEMPT SMART MERGE FIRST
-        // ============================================================================
-        println!("  {} smart merge...", "Attempting".cyan());
 
         let remote_by_path: HashMap<&Path, &ConversationSession> = remote_sessions
             .iter()
             .map(|session| (session.file_path.as_path(), session))
             .collect();
 
+        // `-i` in a terminal asks about every diverged session instead of
+        // splitting it; anything else settles on its own.
+        let ask = interactive && interactive_conflict::is_interactive();
+        let mut to_ask: Vec<crate::conflict::Conflict> = Vec::new();
         let mut smart_merge_success_count = 0;
+        let mut smart_merge_attempts = 0;
         let mut smart_merge_failed_conflicts = Vec::new();
 
         for conflict in detector.conflicts_mut() {
@@ -450,46 +688,170 @@ pub fn pull_history(
                 );
                 continue;
             }
+            let relative = conflict
+                .local_file
+                .strip_prefix(&claude_dir)
+                .unwrap_or(&conflict.local_file)
+                .to_path_buf();
+            // A running session is still being written: never rewrite it
+            // under Claude Code. Its turn comes on a later sync.
+            if branches.defer_if_live(&relative) {
+                continue;
+            }
             // The two transcripts this conflict is between, by their own paths:
             // an interior session id is shared by every subagent of a session,
             // and by a session resumed in another project.
-            if let (Some(local_session), Some(remote_session)) = (
+            let (Some(local_session), Some(remote_session)) = (
                 local_by_path.get(conflict.local_file.as_path()),
                 remote_by_path.get(conflict.remote_file.as_path()),
-            ) {
-                // Try smart merge
-                match conflict.smart_merge_into_local_file(local_session, remote_session) {
-                    Ok(()) => {
-                        smart_merge_success_count += 1;
-                        if let crate::conflict::ConflictResolution::SmartMerge { ref stats } =
-                            conflict.resolution
-                        {
-                            println!(
-                                "  {} Smart merged {} ({} local + {} remote = {} total, {} branches)",
-                                "✓".green(),
-                                conflict.session_id,
-                                stats.local_messages,
-                                stats.remote_messages,
-                                stats.merged_messages,
-                                stats.branches_detected
-                            );
+            ) else {
+                continue;
+            };
+
+            let local_bytes = std::fs::read(&conflict.local_file)
+                .with_context(|| format!("Failed to read {}", conflict.local_file.display()))?;
+            let remote_bytes = std::fs::read(&conflict.remote_file)
+                .with_context(|| format!("Failed to read {}", conflict.remote_file.display()))?;
+            let resumable = crate::branches::top_level_session_id(&relative).map(str::to_string);
+            let session_id = resumable.as_deref().unwrap_or(&conflict.session_id);
+
+            match crate::branches::reconcile(session_id, &local_bytes, &remote_bytes) {
+                Reconciled::Same | Reconciled::KeepLocal => {
+                    branches.counts.kept_local += 1;
+                    conflict.resolution = reconciled("kept local: it holds every remote entry");
+                }
+                Reconciled::TakeRemote => {
+                    branches.write(&conflict.local_file, &remote_bytes)?;
+                    branches.counts.fast_forwarded += 1;
+                    conflict.resolution = reconciled("fast-forwarded to the remote copy");
+                }
+                Reconciled::Combined(bytes) => {
+                    branches.write(&conflict.local_file, &bytes)?;
+                    branches.counts.combined += 1;
+                    conflict.resolution =
+                        reconciled("combined: one side's messages, the other's metadata");
+                }
+                Reconciled::Split {
+                    winner,
+                    branch_id,
+                    branch,
+                } => {
+                    let Some(session_id) = resumable.as_deref() else {
+                        // A subagent transcript is not resumed on its own:
+                        // it keeps the smart merge.
+                        smart_merge_attempts += 1;
+                        match conflict.smart_merge_into_local_file(local_session, remote_session) {
+                            Ok(()) => {
+                                smart_merge_success_count += 1;
+                                if let crate::conflict::ConflictResolution::SmartMerge {
+                                    ref stats,
+                                } = conflict.resolution
+                                {
+                                    println!(
+                                        "  {} Smart merged {} ({} local + {} remote = {} total, {} branches)",
+                                        "✓".green(),
+                                        conflict.session_id,
+                                        stats.local_messages,
+                                        stats.remote_messages,
+                                        stats.merged_messages,
+                                        stats.branches_detected
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Smart merge failed for {}: {}", conflict.session_id, e);
+                                log::info!("Falling back to manual resolution...");
+                                smart_merge_failed_conflicts.push(conflict.clone());
+                            }
                         }
+                        continue;
+                    };
+                    if ask {
+                        to_ask.push(conflict.clone());
+                        continue;
                     }
-                    Err(e) => {
-                        log::warn!("Smart merge failed for {}: {}", conflict.session_id, e);
-                        log::info!("Falling back to manual resolution...");
-                        smart_merge_failed_conflicts.push(conflict.clone());
-                    }
+                    branches.split(
+                        conflict,
+                        session_id,
+                        winner,
+                        &branch_id,
+                        &branch,
+                        &remote_bytes,
+                    )?;
                 }
             }
         }
 
-        println!(
-            "  {} Successfully smart merged {}/{} conflicts",
-            "✓".green(),
-            smart_merge_success_count,
-            detector.conflict_count()
-        );
+        if smart_merge_attempts > 0 {
+            println!(
+                "  {} Successfully smart merged {}/{} subagent transcripts",
+                "✓".green(),
+                smart_merge_success_count,
+                smart_merge_attempts
+            );
+        }
+
+        if !to_ask.is_empty() {
+            println!(
+                "\n{} {} session(s) were continued on both machines",
+                "→".cyan(),
+                to_ask.len()
+            );
+            let local_by_id: HashMap<String, &ConversationSession> = to_ask
+                .iter()
+                .filter_map(|c| local_by_path.get(c.local_file.as_path()))
+                .map(|s| (s.session_id.clone(), *s))
+                .collect();
+            let remote_by_id: HashMap<String, &ConversationSession> = to_ask
+                .iter()
+                .filter_map(|c| remote_by_path.get(c.remote_file.as_path()))
+                .map(|s| (s.session_id.clone(), *s))
+                .collect();
+            let mut result = interactive_conflict::resolve_transcript_conflicts_interactive(
+                &mut to_ask,
+                &local_by_id,
+                &remote_by_id,
+            )?;
+            for conflict in result.parallel_branch.iter_mut() {
+                let local_bytes = std::fs::read(&conflict.local_file)?;
+                let remote_bytes = std::fs::read(&conflict.remote_file)?;
+                let session_id = conflict.session_id.clone();
+                if let Reconciled::Split {
+                    winner,
+                    branch_id,
+                    branch,
+                } = crate::branches::reconcile(&session_id, &local_bytes, &remote_bytes)
+                {
+                    branches.split(
+                        conflict,
+                        &session_id,
+                        winner,
+                        &branch_id,
+                        &branch,
+                        &remote_bytes,
+                    )?;
+                }
+            }
+            let renames = interactive_conflict::apply_resolutions(
+                &result,
+                &remote_sessions,
+                &claude_dir,
+                &remote_projects_dir,
+            )?;
+            for (_, renamed) in &renames {
+                branches.written.insert(renamed.clone());
+            }
+            // The report shows what was chosen for each.
+            for chosen in result.all() {
+                if let Some(conflict) = detector
+                    .conflicts_mut()
+                    .iter_mut()
+                    .find(|c| c.local_file == chosen.local_file)
+                {
+                    conflict.resolution = chosen.resolution.clone();
+                }
+            }
+        }
 
         // If some smart merges failed, handle them with interactive/keep-both resolution
         let renames = if !smart_merge_failed_conflicts.is_empty() {
@@ -514,18 +876,12 @@ pub fn pull_history(
                 )?;
 
                 // Apply the resolutions
-                let renames = crate::interactive_conflict::apply_resolutions(
+                crate::interactive_conflict::apply_resolutions(
                     &resolution_result,
                     &remote_sessions,
                     &claude_dir,
                     &remote_projects_dir,
-                )?;
-
-                // Save conflict report
-                let report = ConflictReport::from_conflicts(detector.conflicts());
-                save_conflict_report(&report)?;
-
-                renames
+                )?
             } else {
                 // Non-interactive mode: use "keep both" strategy for failed merges
                 println!(
@@ -562,14 +918,9 @@ pub fn pull_history(
                     }
                 }
 
-                // Save conflict report
-                let report = ConflictReport::from_conflicts(detector.conflicts());
-                save_conflict_report(&report)?;
-
                 renames
             }
         } else {
-            // All conflicts resolved via smart merge
             Vec::new()
         };
 
@@ -609,6 +960,12 @@ pub fn pull_history(
                 }
             }
         }
+
+        branches.print_counts();
+
+        // Save conflict report
+        let report = ConflictReport::from_conflicts(detector.conflicts());
+        save_conflict_report(&report)?;
 
         println!(
             "\n{} View details with: claude-code-sync report",
@@ -673,10 +1030,28 @@ pub fn pull_history(
             if local.content_hash() == remote_session.content_hash() {
                 unchanged_count += 1;
                 SyncOperation::Unchanged
+            } else if branches.defer_if_live(&relative_path_for_tracking) {
+                continue;
             } else {
                 modified_count += 1;
                 SyncOperation::Modified
             }
+        } else if dest_path.exists() {
+            // Not there when this pull looked, there now: a branch the
+            // split above derived — the same one the other machine pushed
+            // — or a file that appeared meanwhile. Settle, never overwrite.
+            if branches.defer_if_live(&relative_path_for_tracking) {
+                continue;
+            }
+            let remote_bytes = std::fs::read(&remote_session.file_path)?;
+            let stem = remote_session.session_id.clone();
+            if branches.settle_branch(&dest_path, &stem, &remote_bytes)? {
+                modified_count += 1;
+                merged_count += 1;
+            } else {
+                unchanged_count += 1;
+            }
+            continue;
         } else {
             added_count += 1;
             SyncOperation::Added
@@ -944,6 +1319,7 @@ pub fn pull_history(
             skipped_no_local_match
         );
     }
+    branches.print_deferred();
     // Same zero-noise rule as the earlier counts line (plus unchanged,
     // which the summary row carries): a kept-local-only pull prints its
     // KEEP hint, not an all-zeros summary row.
@@ -1078,8 +1454,85 @@ mod tests {
         ];
 
         for (name, file, expected) in cases {
-            let choice = settle_conflict(&file, false, &filter).unwrap();
+            let choice = settle_conflict(&file, false, &filter, Path::new("/repo")).unwrap();
             assert_eq!(choice, expected, "{name}");
         }
+    }
+    fn git_in(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn transcript_line(uuid: &str, parent: &str, minute: u32, text: &str) -> String {
+        format!(
+            "{{\"parentUuid\":\"{parent}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\
+             \"content\":\"{text}\"}},\"uuid\":\"{uuid}\",\"timestamp\":\"2026-11-17T10:{minute:02}:00.000Z\",\
+             \"sessionId\":\"{SESSION}\"}}\n"
+        )
+    }
+
+    const SESSION: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn a_transcript_both_machines_pushed_is_split_rather_than_interleaved() {
+        let root = tempfile::TempDir::new().unwrap();
+        git_in(root.path(), &["init", "--bare", "--quiet", "origin"]);
+        let transcript = format!("projects/-p/{SESSION}.jsonl");
+        let prefix = transcript_line("p1", "none", 0, "hola");
+
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        git_in(root.path(), &["clone", "--quiet", "origin", "first"]);
+        git_in(&first, &["config", "user.name", "First"]);
+        git_in(&first, &["config", "user.email", "first@local"]);
+        crate::scm::attributes::ensure_sync_attributes(&first).unwrap();
+        crate::scm::attributes::ensure_transcript_rule(&first, "projects").unwrap();
+        std::fs::create_dir_all(first.join("projects/-p")).unwrap();
+        std::fs::write(first.join(&transcript), &prefix).unwrap();
+        let machine = scm::open(&first).unwrap();
+        machine.stage_all().unwrap();
+        machine.commit("start").unwrap();
+        let branch = machine.current_branch().unwrap();
+        machine.push("origin", &branch).unwrap();
+
+        git_in(root.path(), &["clone", "--quiet", "origin", "second"]);
+        git_in(&second, &["config", "user.name", "Second"]);
+        git_in(&second, &["config", "user.email", "second@local"]);
+        let from_second = format!("{prefix}{}", transcript_line("b1", "p1", 5, "desde B"));
+        std::fs::write(second.join(&transcript), &from_second).unwrap();
+        let other = scm::open(&second).unwrap();
+        other.stage_all().unwrap();
+        other.commit("B continues").unwrap();
+        other.push("origin", &branch).unwrap();
+
+        let from_first = format!("{prefix}{}", transcript_line("a1", "p1", 9, "desde A"));
+        std::fs::write(first.join(&transcript), &from_first).unwrap();
+        machine.stage_all().unwrap();
+        machine.commit("A continues").unwrap();
+
+        let filter = FilterConfig::default();
+        let resolve = |file: &scm::ConflictedFile| settle_conflict(file, false, &filter, &first);
+        machine.pull("origin", &branch, &resolve).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(first.join(&transcript)).unwrap(),
+            from_second,
+            "the continuation that started first keeps the session, uninterleaved"
+        );
+        let branch_id = crate::branches::branch_session_id(SESSION, "a1");
+        let branch_file = first.join(format!("projects/-p/{branch_id}.jsonl"));
+        let branch_text = std::fs::read_to_string(&branch_file).unwrap();
+        assert!(branch_text.contains("desde A") && !branch_text.contains("desde B"));
+        assert!(!branch_text.contains(SESSION));
+        assert!(!machine.has_unfinished_merge(), "the merge is committed");
     }
 }

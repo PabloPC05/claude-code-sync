@@ -221,6 +221,10 @@ pub fn push_history(
     }
 
     crate::scm::attributes::ensure_sync_attributes(&state.sync_repo_path)?;
+    crate::scm::attributes::ensure_transcript_rule(
+        &state.sync_repo_path,
+        &filter.sync_subdirectory,
+    )?;
 
     let claude_dir = claude_projects_dir()?;
 

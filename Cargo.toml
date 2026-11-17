@@ -63,7 +63,7 @@ walkdir = "2.5"
 rayon = "1.11"
 colored = "3.1.1"
 dirs = "6.0.0"
-uuid = { version = "1.23.3", features = ["v4", "serde"] }
+uuid = { version = "1.23.3", features = ["v4", "v5", "serde"] }
 base64 = "0.22.1"
 inquire = "0.9.4"
 log = "0.4.33"
@@ -73,6 +73,11 @@ tempfile = "3.27.0"
 sha2 = "0.11.0"
 semver = "1.0.28"
 self-replace = "1.5.0"
+
+# Liveness of a Claude Code session (kill(pid, 0)) and the user id
+# `launchctl` addresses a LaunchAgent by.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # `self-update` networking and archive handling. Release assets are .tar.gz
 # everywhere except Windows, which ships .zip.
