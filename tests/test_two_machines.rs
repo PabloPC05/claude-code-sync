@@ -27,7 +27,7 @@ const LONG: &str = "c0ffee00-1234-4abc-8def-0123456789ab";
 /// A long folder name: the project's encoded directory is cut at 200
 /// characters and hashed, differently on each machine.
 const LONG_NAME: &str = "un-proyecto-con-un-nombre-largo-de-verdad-para-pasar-de-los-doscientos-\
-                         caracteres-de-la-codificacion-de-claude-code";
+                         caracteres-de-la-codificacion-de-claude-code-aunque-la-carpeta-temporal-sea-muy-corta-del-todo";
 
 struct Machine {
     claude: PathBuf,

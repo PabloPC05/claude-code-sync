@@ -1206,6 +1206,8 @@ mod tests {
         }
     }
 
+    // launchd/systemd/cron files carry Unix paths; only built on Unix.
+    #[cfg(unix)]
     #[test]
     fn the_launch_agent_runs_at_load_and_every_interval_with_a_log() {
         let mut mac = layout(Platform::MacOs);
@@ -1230,6 +1232,8 @@ mod tests {
         assert!(plist.contains("<string>/a&amp;b</string>"), "XML-escaped");
     }
 
+    // launchd/systemd/cron files carry Unix paths; only built on Unix.
+    #[cfg(unix)]
     #[test]
     fn the_mac_install_bootstraps_the_agent_in_the_gui_domain() {
         let plan = install_plan(&layout(Platform::MacOs), 10, true, None).unwrap();
@@ -1257,6 +1261,8 @@ mod tests {
         );
     }
 
+    // launchd/systemd/cron files carry Unix paths; only built on Unix.
+    #[cfg(unix)]
     #[test]
     fn the_systemd_units_run_one_sync_on_a_timer() {
         let linux = layout(Platform::Linux);
@@ -1298,6 +1304,8 @@ mod tests {
         assert_eq!(systemd_quote(r#"a%b"c\d"#), r#""a%%b\"c\\d""#);
     }
 
+    // launchd/systemd/cron files carry Unix paths; only built on Unix.
+    #[cfg(unix)]
     #[test]
     fn without_systemd_a_crontab_line_does_the_same() {
         let linux = layout(Platform::Linux);
