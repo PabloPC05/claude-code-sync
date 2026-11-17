@@ -318,6 +318,30 @@ pub fn relaunch_args(original: &[String], session_id: &str, prompt: Option<&str>
 /// escape the closing quote). An empty argument becomes `""`, because
 /// legacy passing drops an empty one altogether.
 pub fn escape_ps_legacy(arg: &str) -> String {
+    escape_legacy(arg, true)
+}
+
+/// The same for PowerShell 6 and later run with legacy argument passing
+/// (`$PSNativeCommandArgumentPassing = 'Legacy'`). Those already double a
+/// trailing run of backslashes when they wrap an argument in quotes (seen on
+/// a Windows runner with PowerShell 7: doubling it here too left one
+/// backslash too many), so only the quotes inside are escaped.
+pub fn escape_ps_legacy_core(arg: &str) -> String {
+    escape_legacy(arg, false)
+}
+
+/// How a PowerShell passes arguments to a native program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy {
+    /// Standard passing (PowerShell 7.3 and later by default): no escaping.
+    None,
+    /// Windows PowerShell 5.1: [`escape_ps_legacy`].
+    Desktop,
+    /// PowerShell 6 or later with legacy passing: [`escape_ps_legacy_core`].
+    Core,
+}
+
+fn escape_legacy(arg: &str, double_trailing: bool) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
     }
@@ -341,7 +365,7 @@ pub fn escape_ps_legacy(arg: &str) -> String {
             }
         }
     }
-    if wrapped {
+    if wrapped && double_trailing {
         out.push_str(&"\\".repeat(backslashes));
     }
     out
@@ -406,7 +430,7 @@ pub fn render(args: &[String], format: Format) -> Vec<u8> {
 pub fn take_reload(
     shell: u32,
     original: &[String],
-    ps_legacy: bool,
+    legacy: Legacy,
     note: &mut dyn Write,
 ) -> Option<Vec<String>> {
     let request = consume_request(shell)?;
@@ -434,8 +458,10 @@ pub fn take_reload(
         }
     }
     let mut args = relaunch_args(original, &request.session_id, prompt);
-    if ps_legacy {
-        args = args.iter().map(|a| escape_ps_legacy(a)).collect();
+    match legacy {
+        Legacy::None => {}
+        Legacy::Desktop => args = args.iter().map(|a| escape_ps_legacy(a)).collect(),
+        Legacy::Core => args = args.iter().map(|a| escape_ps_legacy_core(a)).collect(),
     }
     Some(args)
 }
@@ -448,11 +474,11 @@ fn save_prompt(path: &Path, prompt: &str) -> Result<()> {
 /// `guard take-reload`.
 pub fn take_reload_command(
     shell: u32,
-    ps_legacy: bool,
+    legacy: Legacy,
     format: Format,
     original: &[String],
 ) -> Result<()> {
-    if let Some(args) = take_reload(shell, original, ps_legacy, &mut std::io::stderr()) {
+    if let Some(args) = take_reload(shell, original, legacy, &mut std::io::stderr()) {
         let mut out = std::io::stdout().lock();
         out.write_all(&render(&args, format))?;
         out.flush()?;
@@ -658,6 +684,9 @@ mod tests {
         assert_eq!(escape_ps_legacy("línea\nnueva"), "línea\nnueva");
         assert_eq!(escape_ps_legacy("año é 😀"), "año é 😀");
         assert_eq!(escape_ps_legacy(r#"\\""#), r#"\\\\\""#);
+        // PowerShell 6+ in legacy mode doubles the trailing run itself.
+        assert_eq!(escape_ps_legacy_core(r"C:\my dir\"), r"C:\my dir\");
+        assert_eq!(escape_ps_legacy_core(r#"say "hi" \"#), r#"say \"hi\" \"#);
     }
 
     #[test]
@@ -814,19 +843,28 @@ y otra línea\"#,
         let _env = Env::new();
         let mut note = Vec::new();
         assert_eq!(
-            take_reload(9, &v(&["--model", "haiku"]), false, &mut note),
+            take_reload(9, &v(&["--model", "haiku"]), Legacy::None, &mut note),
             None
         );
         write_request(9, &request("con \"comillas\"")).unwrap();
         assert_eq!(
-            take_reload(9, &v(&["--model", "haiku", "--continue"]), false, &mut note),
+            take_reload(
+                9,
+                &v(&["--model", "haiku", "--continue"]),
+                Legacy::None,
+                &mut note
+            ),
             Some(v(&["--model", "haiku", "--resume", ID, "con \"comillas\""]))
         );
-        assert_eq!(take_reload(9, &[], false, &mut note), None, "consumed");
+        assert_eq!(
+            take_reload(9, &[], Legacy::None, &mut note),
+            None,
+            "consumed"
+        );
 
         write_request(9, &request("con \"comillas\"")).unwrap();
         assert_eq!(
-            take_reload(9, &[], true, &mut note),
+            take_reload(9, &[], Legacy::Desktop, &mut note),
             Some(v(&["--resume", ID, r#"con \"comillas\""#]))
         );
         assert!(note.is_empty());
@@ -839,7 +877,7 @@ y otra línea\"#,
         let long = "ñ".repeat(MAX_PROMPT_CHARS + 1);
         write_request(3, &request(&long)).unwrap();
         let mut note = Vec::new();
-        let args = take_reload(3, &v(&["--model", "haiku"]), false, &mut note).unwrap();
+        let args = take_reload(3, &v(&["--model", "haiku"]), Legacy::None, &mut note).unwrap();
         assert_eq!(args, v(&["--model", "haiku", "--resume", ID]));
         let file = reload_dir().unwrap().join(LAST_PROMPT_FILE);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), long);
@@ -849,7 +887,7 @@ y otra línea\"#,
         // Exactly the limit still goes on the command line.
         let edge = "ñ".repeat(MAX_PROMPT_CHARS);
         write_request(3, &request(&edge)).unwrap();
-        let args = take_reload(3, &[], false, &mut Vec::new()).unwrap();
+        let args = take_reload(3, &[], Legacy::None, &mut Vec::new()).unwrap();
         assert_eq!(args, v(&["--resume", ID, &edge]));
     }
 

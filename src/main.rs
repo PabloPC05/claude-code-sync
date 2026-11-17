@@ -474,6 +474,10 @@ enum GuardAction {
         /// argument passing
         #[arg(long)]
         ps_legacy: bool,
+        /// Escape the arguments for PowerShell 6+ run with legacy native
+        /// argument passing
+        #[arg(long, conflicts_with = "ps_legacy")]
+        ps_legacy_core: bool,
         /// How to print the arguments
         #[arg(long, value_enum, default_value = "json")]
         format: ReloadFormat,
@@ -649,11 +653,18 @@ fn main() -> Result<()> {
             GuardAction::TakeReload {
                 shell,
                 ps_legacy,
+                ps_legacy_core,
                 format,
                 args,
             } => claude_code_sync::reload::take_reload_command(
                 *shell,
-                *ps_legacy,
+                if *ps_legacy {
+                    claude_code_sync::reload::Legacy::Desktop
+                } else if *ps_legacy_core {
+                    claude_code_sync::reload::Legacy::Core
+                } else {
+                    claude_code_sync::reload::Legacy::None
+                },
                 match format {
                     ReloadFormat::Json => claude_code_sync::reload::Format::Json,
                     ReloadFormat::Nul => claude_code_sync::reload::Format::Nul,

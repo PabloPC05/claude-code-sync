@@ -143,9 +143,9 @@ function claude {{
   $orig = @($args)
   if (($orig -contains '-p') -or ($orig -contains '--print')) {{ & $real @orig; return }}
   $ccs = {exe}
-  $legacy = ($PSVersionTable.PSVersion.Major -lt 7) -or (($PSVersionTable.PSVersion.Major -eq 7) -and ($PSVersionTable.PSVersion.Minor -lt 3)) -or ($PSNativeCommandArgumentPassing -eq 'Legacy')
   $extra = @()
-  if ($legacy) {{ $extra = @('--ps-legacy') }}
+  if ($PSVersionTable.PSEdition -ne 'Core') {{ $extra = @('--ps-legacy') }}
+  elseif (($PSVersionTable.PSVersion.Major -eq 6) -or (($PSVersionTable.PSVersion.Major -eq 7) -and ($PSVersionTable.PSVersion.Minor -lt 3)) -or ($PSNativeCommandArgumentPassing -eq 'Legacy')) {{ $extra = @('--ps-legacy-core') }}
   $argv = $orig
   for ($i = 0; $i -lt 5; $i++) {{
     $env:CLAUDE_GUARD_SHELL = "$PID"
