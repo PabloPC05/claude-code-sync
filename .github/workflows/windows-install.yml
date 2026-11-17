@@ -1,0 +1,39 @@
+name: Windows install
+
+# Checks the one-line PowerShell installer against a published release of this
+# fork, the way a Windows user runs it: `irm .../install.ps1 | iex`.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to install (default latest)
+        required: false
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-latest
+    steps:
+      - name: Install with the one-liner (Windows PowerShell 5.1)
+        shell: powershell
+        env:
+          CCS_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          irm "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.ps1" | iex
+      - name: Run the installed binary from a new shell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\claude-code-sync\claude-code-sync.exe'
+          if (-not (Test-Path $exe)) { throw "not installed at $exe" }
+          & $exe --version
+          & $exe config --help | Select-String -Pattern 'map-root'
+          & $exe autosync --help
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike '*claude-code-sync*') { throw 'install dir was not added to the user PATH' }
+          'PATH ok'
