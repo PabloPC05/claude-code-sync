@@ -434,15 +434,21 @@ enum GuardAction {
         event: GuardEvent,
     },
 
-    /// Add the guard's hooks to ~/.claude/settings.json and raise Claude
-    /// Code's transcript retention (cleanupPeriodDays) to 3650 days
+    /// Add the guard's hooks to ~/.claude/settings.json, raise Claude
+    /// Code's transcript retention (cleanupPeriodDays) to 3650 days and put
+    /// the `claude` shell function in the shell profiles (it reloads a stale
+    /// window on its own)
     Install {
         /// Print what would change without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Do not install the `claude` shell function
+        #[arg(long)]
+        no_shell: bool,
     },
 
-    /// Remove the guard's hooks (the retention setting stays)
+    /// Remove the guard's hooks and the `claude` shell function (the
+    /// retention setting stays)
     Uninstall {
         /// Print what would change without changing anything
         #[arg(long)]
@@ -634,7 +640,9 @@ fn main() -> Result<()> {
                 claude_code_sync::guard::run_hook((*event).into());
                 std::process::exit(0);
             }
-            GuardAction::Install { dry_run } => claude_code_sync::guard::install(*dry_run),
+            GuardAction::Install { dry_run, no_shell } => {
+                claude_code_sync::guard::install(*dry_run, !*no_shell)
+            }
             GuardAction::Uninstall { dry_run } => claude_code_sync::guard::uninstall(*dry_run),
             GuardAction::Status => claude_code_sync::guard::status(),
             GuardAction::Sweep => claude_code_sync::guard::sweep(),

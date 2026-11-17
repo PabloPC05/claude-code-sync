@@ -184,6 +184,9 @@ pub mod guard;
 /// ending the window, and the arguments of the relaunch (`guard take-reload`).
 pub mod reload;
 
+/// The `claude` shell function `guard install` puts in the shell profiles.
+pub mod wrapper;
+
 /// Automatic sync: a timer (LaunchAgent, systemd user timer or Task
 /// Scheduler task) plus a Claude Code `SessionEnd` hook.
 pub mod autosync;

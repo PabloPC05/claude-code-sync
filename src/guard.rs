@@ -1525,32 +1525,36 @@ fn write_settings(path: &Path, text: &str) -> Result<()> {
     branches::write_file(path, text.as_bytes())
 }
 
-/// `guard install`.
-pub fn install(dry_run: bool) -> Result<()> {
+/// `guard install`: the hooks in `settings.json`, then (unless `shell` is
+/// false) the `claude` function in the shell profiles.
+pub fn install(dry_run: bool, shell: bool) -> Result<()> {
     let path = settings_path()?;
     let exe = std::env::current_exe().context("Cannot tell where this binary is")?;
     let original = read_settings(&path)?;
     let plan = settings_after_install(original.as_deref(), &exe)?;
-    let Some((text, changes)) = plan else {
-        println!("{} the guard is already installed", "✓".green());
-        return Ok(());
-    };
-    if dry_run {
-        println!("{}", "guard install --dry-run would:".bold());
-        println!("  {} {}", "edit".green(), path.display());
-        for change in &changes {
-            println!("    {change}");
+    match plan {
+        None => println!("{} the guard is already installed", "✓".green()),
+        Some((_, changes)) if dry_run => {
+            println!("{}", "guard install --dry-run would:".bold());
+            println!("  {} {}", "edit".green(), path.display());
+            for change in &changes {
+                println!("    {change}");
+            }
         }
-        return Ok(());
+        Some((text, changes)) => {
+            write_settings(&path, &text)?;
+            for change in &changes {
+                println!("  {} {change}", "✓".green());
+            }
+            println!(
+                "{} the guard is on: windows already open pick the hooks up in a new session",
+                "✓".green()
+            );
+        }
     }
-    write_settings(&path, &text)?;
-    for change in &changes {
-        println!("  {} {change}", "✓".green());
+    if shell {
+        crate::wrapper::install(dry_run)?;
     }
-    println!(
-        "{} the guard is on: windows already open pick the hooks up in a new session",
-        "✓".green()
-    );
     Ok(())
 }
 
@@ -1558,26 +1562,27 @@ pub fn install(dry_run: bool) -> Result<()> {
 pub fn uninstall(dry_run: bool) -> Result<()> {
     let path = settings_path()?;
     let original = read_settings(&path)?;
-    let Some((text, changes)) = settings_after_uninstall(original.as_deref())? else {
-        println!("The guard's hooks are not installed");
-        return Ok(());
-    };
-    if dry_run {
-        println!("{}", "guard uninstall --dry-run would:".bold());
-        println!("  {} {}", "edit".green(), path.display());
-        for change in &changes {
-            println!("    {change}");
+    match settings_after_uninstall(original.as_deref())? {
+        None => println!("The guard's hooks are not installed"),
+        Some((_, changes)) if dry_run => {
+            println!("{}", "guard uninstall --dry-run would:".bold());
+            println!("  {} {}", "edit".green(), path.display());
+            for change in &changes {
+                println!("    {change}");
+            }
         }
-        return Ok(());
+        Some((text, changes)) => {
+            write_settings(&path, &text)?;
+            for change in &changes {
+                println!("  {} {change}", "✓".green());
+            }
+            println!(
+                "{} guard removed (cleanupPeriodDays is left as it is)",
+                "✓".green()
+            );
+        }
     }
-    write_settings(&path, &text)?;
-    for change in &changes {
-        println!("  {} {change}", "✓".green());
-    }
-    println!(
-        "{} guard removed (cleanupPeriodDays is left as it is)",
-        "✓".green()
-    );
+    crate::wrapper::uninstall(dry_run)?;
     Ok(())
 }
 
@@ -1627,6 +1632,7 @@ pub fn status() -> Result<()> {
             None => "30 days (default; older transcripts are deleted locally)".yellow(),
         }
     );
+    crate::wrapper::status()?;
     prune_dead_records();
     println!("  Windows recorded: {}", record_pids().len());
     let pending = pending_conflicts()?;

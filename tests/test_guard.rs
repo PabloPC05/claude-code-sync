@@ -46,6 +46,24 @@ impl Env {
         self.tmp.path().join("cfg/claude-code-sync/guard/windows")
     }
 
+    /// The profile files `guard install` writes the `claude` function to:
+    /// never the real ones.
+    fn profile_files(&self) -> std::ffi::OsString {
+        std::env::join_paths([self.bashrc(), self.ps_profile()]).unwrap()
+    }
+
+    fn bashrc(&self) -> PathBuf {
+        self.tmp.path().join("home/.bashrc")
+    }
+
+    fn ps_profile(&self) -> PathBuf {
+        self.tmp.path().join("home/Documents/profile.ps1")
+    }
+
+    fn reload_dir(&self) -> PathBuf {
+        self.tmp.path().join("cfg/claude-code-sync/guard/reload")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-code-sync"));
         command
@@ -53,7 +71,10 @@ impl Env {
             .env("CLAUDE_CODE_SYNC_CLAUDE_DIR", self.claude())
             .env("CLAUDE_CODE_SYNC_HOME", self.tmp.path().join("home"))
             .env("HOME", self.tmp.path().join("home"))
+            .env("CLAUDE_CODE_SYNC_PROFILE_FILES", self.profile_files())
             .env_remove("CLAUDE_CODE_SYNC_HOOK_PID")
+            .env_remove("CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT")
+            .env_remove("CLAUDE_GUARD_SHELL")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -62,7 +83,12 @@ impl Env {
 
     /// `guard hook <event>` as the window would run it.
     fn hook(&self, event: &str, stdin: &str) -> Output {
+        self.hook_with(event, stdin, &[])
+    }
+
+    fn hook_with(&self, event: &str, stdin: &str, env: &[(&str, &str)]) -> Output {
         let mut command = self.command();
+        command.envs(env.iter().copied());
         command
             .args(["guard", "hook", event])
             .env("CLAUDE_CODE_SYNC_HOOK_PID", self.window.id().to_string())
@@ -508,4 +534,177 @@ fn install_refuses_while_the_autosync_hooks_are_there() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read_to_string(&settings).unwrap(), autosync);
+}
+
+/// A window Syncthing left behind: loaded, then the file was replaced by one
+/// with the other PC's turns.
+fn stale_window(env: &Env) {
+    std::fs::write(env.transcript(), pc_a()).unwrap();
+    env.hook("start", &env.input_with_source("startup"));
+    syncthing_replaces(&env.transcript(), &(pc_a() + &pc_b_turns()));
+}
+
+fn typed(env: &Env, text: &str) -> String {
+    format!(
+        "{{\"session_id\":\"{SESSION}\",\"transcript_path\":{},\"cwd\":\"/work\",\"prompt\":{}}}",
+        serde_json::to_string(&env.transcript().to_string_lossy()).unwrap(),
+        serde_json::to_string(text).unwrap()
+    )
+}
+
+/// Wait for `child` to end, up to 10 seconds.
+fn ended_within_10s(child: &mut Child) -> bool {
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn a_stale_window_started_by_the_wrapper_is_ended_and_its_text_kept_for_the_reload() {
+    let mut env = Env::new();
+    stale_window(&env);
+    let text = "dice \"hola\" \\ ñ 😀\nsegunda línea";
+    let shell = "4242";
+
+    let output = env.hook_with(
+        "prompt",
+        &typed(&env, text),
+        &[
+            ("CLAUDE_GUARD_SHELL", shell),
+            ("CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT", shell),
+        ],
+    );
+    assert!(output.status.success());
+    let decision: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(decision["decision"], "block");
+    let reason = decision["reason"].as_str().unwrap();
+    assert!(reason.starts_with("Recargando este chat"), "{reason}");
+    assert!(reason.contains(&format!("/resume {SESSION}")), "{reason}");
+    assert!(
+        ended_within_10s(&mut env.window),
+        "the window is still there"
+    );
+
+    // What the wrapper asks `take-reload` for next: the original options,
+    // the chat and the text, once.
+    let reload = env.run(&[
+        "guard",
+        "take-reload",
+        "--shell",
+        shell,
+        "--",
+        "--model",
+        "haiku",
+        "--continue",
+    ]);
+    assert!(reload.status.success());
+    let args: Vec<String> = serde_json::from_str(stdout(&reload).trim()).unwrap();
+    assert_eq!(args, ["--model", "haiku", "--resume", SESSION, text]);
+    assert!(stdout(&reload).is_ascii());
+    let again = env.run(&[
+        "guard",
+        "take-reload",
+        "--shell",
+        shell,
+        "--",
+        "--model",
+        "x",
+    ]);
+    assert!(again.status.success());
+    assert_eq!(stdout(&again), "");
+    assert!(env.reload_dir().read_dir().map_or(true, |d| d.count() == 0));
+}
+
+#[test]
+fn a_stale_window_the_wrapper_did_not_start_is_only_blocked() {
+    let mut env = Env::new();
+    stale_window(&env);
+    let text = "hola";
+
+    // No CLAUDE_GUARD_SHELL; one that is not the window's parent (a nested
+    // Claude inherits it); one that is not a number.
+    let cases: [&[(&str, &str)]; 3] = [
+        &[("CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT", "4242")],
+        &[
+            ("CLAUDE_GUARD_SHELL", "4242"),
+            ("CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT", "9999"),
+        ],
+        &[
+            ("CLAUDE_GUARD_SHELL", "mine"),
+            ("CLAUDE_CODE_SYNC_HOOK_SHELL_PARENT", "4242"),
+        ],
+    ];
+    for vars in cases {
+        let output = env.hook_with("prompt", &typed(&env, text), vars);
+        assert!(output.status.success());
+        let decision: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+        assert_eq!(decision["decision"], "block");
+        assert!(
+            decision["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("/resume {SESSION} y luego")),
+            "{decision}"
+        );
+        assert!(env.window.try_wait().unwrap().is_none(), "{vars:?}");
+        assert!(env.reload_dir().read_dir().map_or(true, |d| d.count() == 0));
+    }
+}
+
+#[test]
+fn install_puts_the_wrapper_in_the_profiles_and_uninstall_takes_it_out() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.bashrc().parent().unwrap()).unwrap();
+    std::fs::write(env.bashrc(), "export A=1\nalias ll='ls -l'\n").unwrap();
+    let begin = "# >>> claude-code-sync guard >>>";
+    let end = "# <<< claude-code-sync guard <<<";
+
+    // --no-shell: the hooks only.
+    let hooks_only = env.run(&["guard", "install", "--no-shell"]);
+    assert!(hooks_only.status.success());
+    assert_eq!(
+        std::fs::read_to_string(env.bashrc()).unwrap(),
+        "export A=1\nalias ll='ls -l'\n"
+    );
+    assert!(!env.ps_profile().exists());
+
+    // --dry-run writes nothing.
+    let dry = env.run(&["guard", "install", "--dry-run"]);
+    assert!(dry.status.success());
+    assert!(!env.ps_profile().exists());
+
+    let installed = env.run(&["guard", "install"]);
+    assert!(installed.status.success());
+    let bashrc = std::fs::read_to_string(env.bashrc()).unwrap();
+    assert!(bashrc.starts_with("export A=1\nalias ll='ls -l'\n\n# >>>"));
+    assert_eq!(bashrc.matches(begin).count(), 1);
+    assert!(bashrc.contains("take-reload --shell"));
+    let profile = std::fs::read_to_string(env.ps_profile()).unwrap();
+    assert!(profile.starts_with(begin) && profile.trim_end().ends_with(end));
+    assert!(profile.contains("function claude"));
+
+    // Again: nothing changes.
+    env.run(&["guard", "install"]);
+    assert_eq!(std::fs::read_to_string(env.bashrc()).unwrap(), bashrc);
+    assert_eq!(std::fs::read_to_string(env.ps_profile()).unwrap(), profile);
+
+    let status = stdout(&env.run(&["guard", "status"]));
+    assert!(status.contains("claude function in"), "{status}");
+    assert!(status.contains("profile.ps1: installed"), "{status}");
+
+    let removed = env.run(&["guard", "uninstall"]);
+    assert!(removed.status.success());
+    assert_eq!(
+        std::fs::read_to_string(env.bashrc()).unwrap(),
+        "export A=1\nalias ll='ls -l'\n"
+    );
+    assert_eq!(std::fs::read_to_string(env.ps_profile()).unwrap(), "");
+    let status = stdout(&env.run(&["guard", "status"]));
+    assert!(status.contains("profile.ps1: not installed"), "{status}");
+    // Uninstalling again is quiet and harmless.
+    assert!(env.run(&["guard", "uninstall"]).status.success());
 }
