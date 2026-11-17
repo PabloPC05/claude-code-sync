@@ -89,6 +89,8 @@ tar = "0.4.46"
 [target.'cfg(windows)'.dependencies]
 ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# The parent and grandparent of a hook process (see src/stale.rs).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
 walkdir = "2.5"

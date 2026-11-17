@@ -1090,7 +1090,7 @@ pub fn run(detach: bool) -> Result<()> {
 /// Start `autosync run` in its own process group, output appended to the
 /// log, and return without waiting: what the `SessionEnd` hook and the
 /// Windows task launch.
-fn spawn_detached() -> Result<()> {
+pub fn spawn_detached() -> Result<()> {
     let layout = Layout::detect()?;
     let log_path = layout.log_path();
     if let Some(dir) = log_path.parent() {

@@ -169,6 +169,13 @@ pub mod self_update;
 /// config directory, taken by every run that writes.
 pub mod sync_lock;
 
+/// Windows holding an out-of-date chat: markers, the prompt guard's lookup
+/// and the repair when such a window closes.
+pub mod stale;
+
+/// The `claude-code-sync hook <event>` commands Claude Code runs.
+pub mod hooks;
+
 /// Automatic sync: a timer (LaunchAgent, systemd user timer or Task
 /// Scheduler task) plus a Claude Code `SessionEnd` hook.
 pub mod autosync;

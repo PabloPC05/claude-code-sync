@@ -338,6 +338,14 @@ enum Commands {
         action: AutosyncAction,
     },
 
+    /// What Claude Code's hooks run (installed by `autosync install`); reads
+    /// the hook's JSON on stdin and always exits 0
+    Hook {
+        /// The hook event
+        #[arg(value_enum)]
+        event: HookEvent,
+    },
+
     /// Update claude-code-sync to the latest release
     SelfUpdate {
         /// Only report whether an update is available
@@ -381,6 +389,34 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HookEvent {
+    /// UserPromptSubmit: block a prompt typed in an out-of-date window
+    Prompt,
+    /// SessionStart: a window loaded its chat again
+    SessionStart,
+    /// SessionEnd: repair what an out-of-date window appended, then sync
+    SessionEnd,
+    /// Stop: a turn finished; sync in the background
+    Stop,
+    /// Print the ids of this process's parent and grandparent
+    #[value(hide = true)]
+    Whoami,
+}
+
+impl From<HookEvent> for claude_code_sync::hooks::Event {
+    fn from(event: HookEvent) -> Self {
+        use claude_code_sync::hooks::Event;
+        match event {
+            HookEvent::Prompt => Event::Prompt,
+            HookEvent::SessionStart => Event::SessionStart,
+            HookEvent::SessionEnd => Event::SessionEnd,
+            HookEvent::Stop => Event::Stop,
+            HookEvent::Whoami => Event::Whoami,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum RemoteAction {
     /// Show current remote URL
@@ -406,14 +442,14 @@ enum RemoteAction {
 
 #[derive(Subcommand)]
 enum AutosyncAction {
-    /// Install the timer and the SessionEnd hook, and raise Claude Code's
-    /// transcript retention (cleanupPeriodDays) to 3650 days
+    /// Install the timer and the Claude Code hooks (prompt guard, session
+    /// start and end, turn end), and raise Claude Code's transcript retention (cleanupPeriodDays) to 3650 days
     Install {
         /// Minutes between timer runs
         #[arg(long, default_value_t = autosync::DEFAULT_INTERVAL_MINUTES)]
         interval_minutes: u32,
 
-        /// Do not add the SessionEnd hook to ~/.claude/settings.json
+        /// Do not add the hooks to ~/.claude/settings.json
         #[arg(long)]
         no_hooks: bool,
 
@@ -486,13 +522,20 @@ enum HistoryAction {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // A hook runs on every prompt and must never fail: no log rotation, no
+    // onboarding, no lock, and exit 0 whatever happens.
+    if let Some(Commands::Hook { event }) = &cli.command {
+        claude_code_sync::hooks::run((*event).into());
+        std::process::exit(0);
+    }
+
     // Initialize logging (rotate log if needed, then set up logger)
     logger::rotate_log_if_needed().ok(); // Ignore errors during log rotation
     logger::init_logger().ok(); // Ignore errors during logger init
 
     log::debug!("claude-code-sync started");
-
-    let cli = Cli::parse();
 
     // Check if initialization is needed (before processing any command)
     let needs_onboarding = !is_initialized()?;
@@ -925,6 +968,7 @@ fn main() -> Result<()> {
             AutosyncAction::Status => autosync::status()?,
             AutosyncAction::Run { detach } => autosync::run(detach)?,
         },
+        Commands::Hook { .. } => unreachable!("hooks are handled before anything else"),
         Commands::SelfUpdate { check, to, force } => {
             self_update::self_update(check, to.as_deref(), force)?;
         }
