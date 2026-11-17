@@ -466,13 +466,13 @@ impl<'de> serde::Deserialize<'de> for OrderedObject {
 }
 
 /// `settings.json` as members in order, ready to change a few of them.
-struct Settings {
+pub(crate) struct Settings {
     members: Vec<(String, String)>,
     trailing_newline: bool,
 }
 
 impl Settings {
-    fn parse(original: Option<&str>) -> Result<Settings> {
+    pub(crate) fn parse(original: Option<&str>) -> Result<Settings> {
         let text = original.unwrap_or("").trim_start_matches('\u{feff}');
         if text.trim().is_empty() {
             return Ok(Settings {
@@ -492,7 +492,7 @@ impl Settings {
         })
     }
 
-    fn get(&self, key: &str) -> Option<Value> {
+    pub(crate) fn get(&self, key: &str) -> Option<Value> {
         self.members
             .iter()
             .find(|(k, _)| k == key)
@@ -500,7 +500,7 @@ impl Settings {
     }
 
     /// Set a member, in place when it exists, at the end otherwise.
-    fn set(&mut self, key: &str, value: &Value) {
+    pub(crate) fn set(&mut self, key: &str, value: &Value) {
         let text = indent_continuation(&serde_json::to_string_pretty(value).expect("serializes"));
         match self.members.iter_mut().find(|(k, _)| k == key) {
             Some((_, raw)) => *raw = text,
@@ -508,12 +508,12 @@ impl Settings {
         }
     }
 
-    fn remove(&mut self, key: &str) {
+    pub(crate) fn remove(&mut self, key: &str) {
         self.members.retain(|(k, _)| k != key);
     }
 
     /// Two-space indentation, the way Claude Code writes the file.
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut out = String::from("{");
         for (index, (key, raw)) in self.members.iter().enumerate() {
             if index > 0 {
@@ -540,7 +540,7 @@ fn indent_continuation(pretty: &str) -> String {
 /// or without `.exe`, whatever its directory or version suffix), or the
 /// `exe` an install is placing. The new hooks' arguments (`hook prompt`)
 /// are short enough for another tool to use too.
-fn is_our_binary(command: &str, exe: Option<&Path>) -> bool {
+pub(crate) fn is_our_binary(command: &str, exe: Option<&Path>) -> bool {
     if exe.is_some_and(|exe| Path::new(command) == exe) {
         return true;
     }
@@ -551,7 +551,7 @@ fn is_our_binary(command: &str, exe: Option<&Path>) -> bool {
 /// Whether a hook entry under `event` is one autosync installed: the exec
 /// form of that event's hook, or — under `SessionEnd`, where 0.5.0 put it —
 /// the detached run, in exec form or the shell form an earlier build wrote.
-fn is_our_hook(event: &str, hook: &Value, exe: Option<&Path>) -> bool {
+pub(crate) fn is_our_hook(event: &str, hook: &Value, exe: Option<&Path>) -> bool {
     let args: Option<Vec<Option<&str>>> = hook
         .get("args")
         .and_then(|args| args.as_array())
@@ -804,6 +804,13 @@ pub fn install_plan(
             plan.commands
                 .push(schtasks_create(layout, interval_minutes));
         }
+    }
+    if hooks && crate::guard::has_guard_hooks(settings_text) {
+        bail!(
+            "The Syncthing guard's hooks are installed in settings.json. Run `claude-code-sync \
+             guard uninstall` first (or install autosync with --no-hooks): git mode and \
+             Syncthing mode at once would fight over the same transcripts."
+        );
     }
     let hook = hooks.then_some(layout.exe.as_path());
     plan.settings = settings_after_install(settings_text, hook)?;

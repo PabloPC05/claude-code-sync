@@ -346,6 +346,13 @@ enum Commands {
         event: HookEvent,
     },
 
+    /// Syncthing mode: guard chats when Syncthing, not git, carries the
+    /// transcripts between two PCs (needs no repository)
+    Guard {
+        #[command(subcommand)]
+        action: GuardAction,
+    },
+
     /// Update claude-code-sync to the latest release
     SelfUpdate {
         /// Only report whether an update is available
@@ -413,6 +420,64 @@ impl From<HookEvent> for claude_code_sync::hooks::Event {
             HookEvent::SessionEnd => Event::SessionEnd,
             HookEvent::Stop => Event::Stop,
             HookEvent::Whoami => Event::Whoami,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum GuardAction {
+    /// What Claude Code's hooks run (installed by `guard install`); reads
+    /// the hook's JSON on stdin and always exits 0
+    Hook {
+        /// The hook event
+        #[arg(value_enum)]
+        event: GuardEvent,
+    },
+
+    /// Add the guard's hooks to ~/.claude/settings.json and raise Claude
+    /// Code's transcript retention (cleanupPeriodDays) to 3650 days
+    Install {
+        /// Print what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove the guard's hooks (the retention setting stays)
+    Uninstall {
+        /// Print what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show the hooks, the retention, the recorded windows and the conflict
+    /// copies waiting
+    Status,
+
+    /// Settle every Syncthing conflict copy under ~/.claude/projects and
+    /// next to history.jsonl
+    Sweep,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GuardEvent {
+    /// UserPromptSubmit: block a prompt typed in a window that is behind
+    Prompt,
+    /// SessionStart: record what the window loaded; settle conflict copies
+    Start,
+    /// Stop: a turn finished; follow the window's appends
+    Stop,
+    /// SessionEnd: repair what a window that was behind appended
+    End,
+}
+
+impl From<GuardEvent> for claude_code_sync::guard::Event {
+    fn from(event: GuardEvent) -> Self {
+        use claude_code_sync::guard::Event;
+        match event {
+            GuardEvent::Prompt => Event::Prompt,
+            GuardEvent::Start => Event::Start,
+            GuardEvent::Stop => Event::Stop,
+            GuardEvent::End => Event::End,
         }
     }
 }
@@ -529,6 +594,22 @@ fn main() -> Result<()> {
     if let Some(Commands::Hook { event }) = &cli.command {
         claude_code_sync::hooks::run((*event).into());
         std::process::exit(0);
+    }
+
+    // The guard (Syncthing mode) needs neither git nor a sync repository, so
+    // none of its commands reaches onboarding or the sync lock. Its hooks
+    // are as quiet as the others.
+    if let Some(Commands::Guard { action }) = &cli.command {
+        return match action {
+            GuardAction::Hook { event } => {
+                claude_code_sync::guard::run_hook((*event).into());
+                std::process::exit(0);
+            }
+            GuardAction::Install { dry_run } => claude_code_sync::guard::install(*dry_run),
+            GuardAction::Uninstall { dry_run } => claude_code_sync::guard::uninstall(*dry_run),
+            GuardAction::Status => claude_code_sync::guard::status(),
+            GuardAction::Sweep => claude_code_sync::guard::sweep(),
+        };
     }
 
     // Initialize logging (rotate log if needed, then set up logger)
@@ -969,6 +1050,7 @@ fn main() -> Result<()> {
             AutosyncAction::Run { detach } => autosync::run(detach)?,
         },
         Commands::Hook { .. } => unreachable!("hooks are handled before anything else"),
+        Commands::Guard { .. } => unreachable!("the guard is handled before anything else"),
         Commands::SelfUpdate { check, to, force } => {
             self_update::self_update(check, to.as_deref(), force)?;
         }

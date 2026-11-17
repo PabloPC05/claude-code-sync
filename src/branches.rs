@@ -377,7 +377,7 @@ const NOISE_PREFIXES: [&str; 4] = [
 /// Whether an entry with a uuid is a message a person would miss: any
 /// assistant entry, and any user entry that is not a command wrapper (a
 /// tool result counts as real). Everything else is noise.
-fn is_real_message(entry: &serde_json::Value) -> bool {
+pub(crate) fn is_real_message(entry: &serde_json::Value) -> bool {
     match entry.get("type").and_then(|t| t.as_str()) {
         Some("assistant") => true,
         Some("user") => {

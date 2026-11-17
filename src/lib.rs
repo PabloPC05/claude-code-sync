@@ -176,6 +176,10 @@ pub mod stale;
 /// The `claude-code-sync hook <event>` commands Claude Code runs.
 pub mod hooks;
 
+/// Syncthing mode: hooks that keep a chat safe when Syncthing, not git,
+/// carries the transcripts between two PCs.
+pub mod guard;
+
 /// Automatic sync: a timer (LaunchAgent, systemd user timer or Task
 /// Scheduler task) plus a Claude Code `SessionEnd` hook.
 pub mod autosync;

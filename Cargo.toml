@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-sync"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Claude Code User"]
 description = "Sync Claude Code conversation history with git repositories"
@@ -89,8 +89,9 @@ tar = "0.4.46"
 [target.'cfg(windows)'.dependencies]
 ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-# The parent and grandparent of a hook process (see src/stale.rs).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+# The parent and grandparent of a hook process (see src/stale.rs), and the
+# identity of a transcript file (volume serial and file index, src/guard.rs).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
 walkdir = "2.5"
