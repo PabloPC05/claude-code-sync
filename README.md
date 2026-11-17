@@ -492,7 +492,7 @@ git tag v0.4.0 && git push origin v0.4.0
 
 A tag release-please creates works the same way; a tag you push by hand gets a
 release created for it with generated notes. Grab the asset for your platform
-from the [releases page](https://github.com/perfectra1n/claude-code-sync/releases).
+from the [releases page](https://github.com/PabloPC05/claude-code-sync/releases).
 
 To build all of them locally instead — one Linux or macOS host, no Apple
 hardware and no Windows — run `bin/release.sh` (needs `cargo-zigbuild`, zig and
@@ -509,13 +509,13 @@ generated from zig's own API-set definition.
 **Linux / macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.ps1 | iex
 ```
 
 The scripts detect your OS and CPU (x86_64 or ARM64), download the matching
@@ -534,13 +534,13 @@ dependencies, so it runs on any distro, including Alpine and NixOS.
 
 ```bash
 # Pin a version, choose the directory, or pick the glibc build
-curl -fsSL https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.sh | sh -s -- --version v0.3.3 --dir /usr/local/bin --libc gnu
+curl -fsSL https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.sh | sh -s -- --version v0.5.0 --dir /usr/local/bin --libc gnu
 ```
 
 ```powershell
 # `irm | iex` cannot take arguments, so PowerShell options are environment variables
-$env:CCS_VERSION = "v0.3.3"; $env:CCS_INSTALL_DIR = "C:\tools"
-irm https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.ps1 | iex
+$env:CCS_VERSION = "v0.5.0"; $env:CCS_INSTALL_DIR = "C:\tools"
+irm https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.ps1 | iex
 ```
 
 The shell script reads the same `CCS_VERSION`, `CCS_INSTALL_DIR`, and `CCS_LIBC`
@@ -549,6 +549,11 @@ variables. Set `CCS_NO_PATH=1` to stop the PowerShell script from editing PATH.
 **To update:** run `claude-code-sync self-update`, or re-run the install command.
 
 ### Homebrew (macOS / Linux)
+
+> **Fork note:** the Homebrew tap, the Scoop bucket, crates.io and the
+> container image still deliver upstream (perfectra1n) builds, without this
+> fork's additions. Use the install script above, a release download, Nix, or
+> `cargo install --git` to get the fork.
 
 This repository doubles as a Homebrew tap. The URL is required because the
 repository is not named `homebrew-*`:
@@ -575,13 +580,13 @@ scoop install claude-code-sync/claude-code-sync
 
 ```bash
 # Run without installing
-nix run github:perfectra1n/claude-code-sync -- --help
+nix run github:PabloPC05/claude-code-sync -- --help
 
 # Install into your profile
-nix profile install github:perfectra1n/claude-code-sync
+nix profile install github:PabloPC05/claude-code-sync
 ```
 
-Or add `github:perfectra1n/claude-code-sync` as a flake input and use
+Or add `github:PabloPC05/claude-code-sync` as a flake input and use
 `packages.${system}.default`. The package puts `git` on its PATH as a fallback,
 so your own `git` (with its config and credential helpers) still takes precedence.
 
@@ -601,14 +606,14 @@ With `cargo-binstall` installed, `mise use -g cargo:claude-code-sync` uses the s
 To track unreleased changes on `main`:
 
 ```bash
-cargo install --locked --git https://github.com/perfectra1n/claude-code-sync
+cargo install --locked --git https://github.com/PabloPC05/claude-code-sync
 ```
 
 **To update:** re-run the same command.
 
 ### Manual download
 
-Every [release](https://github.com/perfectra1n/claude-code-sync/releases) ships
+Every [release](https://github.com/PabloPC05/claude-code-sync/releases) ships
 these assets, each with a `.sha256` checksum file alongside it:
 
 | Platform | Asset |
@@ -629,7 +634,7 @@ A container image is also published to `ghcr.io/perfectra1n/claude-code-sync`.
 ### From Source
 
 ```bash
-git clone https://github.com/perfectra1n/claude-code-sync
+git clone https://github.com/PabloPC05/claude-code-sync
 cd claude-code-sync
 cargo install --locked --path .
 claude-code-sync --help

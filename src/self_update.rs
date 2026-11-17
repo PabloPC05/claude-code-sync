@@ -4,7 +4,7 @@ use semver::Version;
 use std::io::Read;
 use std::path::Path;
 
-const REPO_URL: &str = "https://github.com/perfectra1n/claude-code-sync";
+const REPO_URL: &str = "https://github.com/PabloPC05/claude-code-sync";
 const BIN_NAME: &str = if cfg!(windows) {
     "claude-code-sync.exe"
 } else {
