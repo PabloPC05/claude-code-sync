@@ -165,14 +165,50 @@ transcripts are taken out of git's union merge (`projects/*/*.jsonl -merge` in
 `.gitattributes`), and a merge of the sync repository settles them the same way.
 
 - **Live sessions are never rewritten.** A session whose
-  `~/.claude/sessions/<pid>.json` names a running process is deferred
-  ("Deferred N live session(s)") and settled on a later sync; pushing its
-  current file is fine.
+  `~/.claude/sessions/<pid>.json` names a running process is not renamed or
+  rewritten. When the repository copy only *added* to it, the missing entries
+  are appended (see [Chats left open](#chats-left-open-on-the-other-pc));
+  anything else (both sides added messages, subagent transcripts, sidecar
+  files) is deferred ("Deferred N live session(s)") and settled on a later
+  sync; pushing its current file is fine.
 - `pull -i` / `sync -i` in a terminal ask about each diverged session, with
   "parallel branch" first beside upstream's smart merge / local / remote / both.
 - Subagent transcripts (inside a session's directory) still use the smart
   merge, which now ends a merged file with the `last-prompt` of its most recent
   branch.
+
+### Chats left open on the other PC
+
+Claude Code loads a transcript once and keeps the conversation in memory; it
+never notices later changes on disk. Leave a chat open (idle) on PC A, continue
+it on PC B, and A's window is out of date. Since 0.6.0:
+
+- **Open windows receive the other PC's turns.** A pull appends them to the
+  transcript of a session that is open here, in one write with the file opened
+  in append mode (never a rename or a rewrite), so a new window opened with
+  `claude --continue` already shows them. The window that was open does not
+  change by itself.
+- **A stale window is guarded.** The pull records which windows (Claude Code
+  process ids) hold the old version in `<config dir>/stale/<session>.json`. The
+  `UserPromptSubmit` hook blocks a prompt typed in such a window and says so:
+  type `/resume`, pick the same chat (the first in the list) to load the latest,
+  then send the message again. The `SessionStart` hook (it also fires for
+  `/resume` inside a running window) clears the mark.
+- **Closing a stale window is repaired.** `/exit` appends three entries to the
+  transcript hanging off the window's old leaf, which makes Claude Code resume
+  the old branch and hides the other PC's turns. When the window closes
+  (`SessionEnd`, or the next sync's sweep if it died without saying), what it
+  appended off the old leaf is taken out: only `/exit` noise is deleted; a real
+  message typed there becomes a `(rama paralela)` session instead. Claude
+  Code's own rewind and edit branches are never touched.
+- **Every finished turn is pushed.** The `Stop` hook (and `SessionStart` and
+  `SessionEnd`) start a detached `autosync run`, so the other PC gets a turn
+  within seconds instead of at the next timer tick. A run that finds the sync
+  lock taken leaves a `sync.rerun` flag; the holder syncs again when it
+  finishes (at most 3 extra rounds).
+
+`autosync install` adds the four hooks; run it again after upgrading from 0.5.0
+(it replaces the old `SessionEnd` hook).
 
 ### Autosync
 
@@ -183,8 +219,9 @@ claude-code-sync autosync uninstall [--dry-run]
 ```
 
 `install` schedules `claude-code-sync autosync run` every N minutes (default
-10) and, unless `--no-hooks`, adds a Claude Code `SessionEnd` hook so a chat
-you close is pushed right away. `--dry-run` prints every file and command
+10) and, unless `--no-hooks`, adds Claude Code hooks (`UserPromptSubmit`,
+`SessionStart`, `SessionEnd`, `Stop`) so a finished turn or a closed chat is
+pushed right away and a stale window is guarded. `--dry-run` prints every file and command
 without touching anything.
 
 | OS | Timer | Output |
@@ -201,17 +238,26 @@ PowerShell to misquote:
 ```json
 "hooks": {"SessionEnd": [{"hooks": [{"type": "command",
   "command": "C:\\Users\\Mateo\\AppData\\Local\\Programs\\claude-code-sync\\claude-code-sync.exe",
-  "args": ["autosync", "run", "--detach"], "timeout": 10}]}]}
+  "args": ["hook", "session-end"], "timeout": 10}]}]}
 ```
 
-`--detach` starts the sync in its own session (Unix) or its own windowless
-console and process group (Windows) and returns within milliseconds, well inside
+| Event | Runs | Timeout |
+|---|---|---|
+| `UserPromptSubmit` | `hook prompt`: blocks a prompt typed in a stale window | 5 s |
+| `SessionStart` | `hook session-start`: the window reloaded, clear its mark; start a sync | 5 s |
+| `SessionEnd` | `hook session-end`: repair a stale window's leftovers; start a sync | 10 s |
+| `Stop` | `hook stop`: start a sync | 5 s |
+
+Every hook exits 0 whatever happens, does no network or git work, and the
+prompt hook returns at once when nothing is stale. The syncs they start are
+`autosync run --detach`: its own session (Unix) or its own windowless
+console and process group (Windows), returning within milliseconds, well inside
 the 1.5 s `SessionEnd` budget; the sync carries on after Claude Code exits. The
 same edit raises `cleanupPeriodDays` to 3650 when it is missing or lower (also
 with `--no-hooks`): Claude Code otherwise deletes transcripts older than 30 days
 on its own. Other members keep their order and text; the file is written as
-UTF-8 without BOM. `uninstall` removes only autosync's hook (in either the exec
-form or the shell form earlier builds wrote), and leaves `cleanupPeriodDays`
+UTF-8 without BOM. `uninstall` removes only autosync's hooks (including the 0.5.0
+`SessionEnd` hook, in either the exec form or the shell form earlier builds wrote), and leaves `cleanupPeriodDays`
 alone.
 
 `autosync run` never prompts, exits 0 when there is nothing to do, and takes an
@@ -534,12 +580,12 @@ dependencies, so it runs on any distro, including Alpine and NixOS.
 
 ```bash
 # Pin a version, choose the directory, or pick the glibc build
-curl -fsSL https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.sh | sh -s -- --version v0.5.0 --dir /usr/local/bin --libc gnu
+curl -fsSL https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.sh | sh -s -- --version v0.6.0 --dir /usr/local/bin --libc gnu
 ```
 
 ```powershell
 # `irm | iex` cannot take arguments, so PowerShell options are environment variables
-$env:CCS_VERSION = "v0.5.0"; $env:CCS_INSTALL_DIR = "C:\tools"
+$env:CCS_VERSION = "v0.6.0"; $env:CCS_INSTALL_DIR = "C:\tools"
 irm https://raw.githubusercontent.com/PabloPC05/claude-code-sync/main/install.ps1 | iex
 ```
 
