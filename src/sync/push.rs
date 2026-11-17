@@ -49,6 +49,9 @@ pub struct PushReport {
     pub modified: usize,
     pub unchanged: usize,
     pub skipped_no_cwd: usize,
+    /// Transcripts left as they are in the repository, which holds entries
+    /// they lack (see `crate::branches::repository_is_ahead`).
+    pub held_back: usize,
     /// Per-category artifact outcomes (empty when no category is enabled).
     pub artifacts: crate::artifacts::engine::ArtifactReport,
 }
@@ -284,19 +287,33 @@ pub fn push_history(
     println!("  {} sessions to sync repository...", "Copying".cyan());
     let plan = plan_push(&sessions, &claude_dir, &projects_dir, &filter)?;
     let added_count = plan.added;
-    let modified_count = plan.modified;
-    let unchanged_count = plan.unchanged;
+    let mut modified_count = plan.modified;
+    let mut unchanged_count = plan.unchanged;
     let skipped_no_cwd = plan.skipped_no_cwd;
 
     // Track pushed conversations for operation record
     let mut pushed_conversations: Vec<ConversationSummary> = Vec::new();
 
+    // Sessions whose repository copy is ahead of this machine's: kept as
+    // they are there, so another machine's turns are never pushed away.
+    let mut held_back: Vec<&std::path::Path> = Vec::new();
+
     for entry in &plan.entries {
         let session = &sessions[entry.session_index];
         let dest_path = projects_dir.join(&entry.relative_path);
+        let mut operation = entry.operation;
 
         if needs_copy(entry, &dest_path) {
-            session.copy_to(&dest_path)?;
+            if repository_is_ahead(&session.file_path, &dest_path)? {
+                held_back.push(&entry.relative_path);
+                if operation == SyncOperation::Modified {
+                    modified_count -= 1;
+                    unchanged_count += 1;
+                }
+                operation = SyncOperation::Unchanged;
+            } else {
+                session.copy_to(&dest_path)?;
+            }
         }
 
         // Track this session in pushed conversations
@@ -306,12 +323,14 @@ pub fn push_history(
             relative_path_str.clone(),
             session.latest_timestamp().map(str::to_string),
             session.message_count(),
-            entry.operation,
+            operation,
         ) {
             Ok(summary) => pushed_conversations.push(summary),
             Err(e) => log::warn!("Failed to create summary for {}: {}", relative_path_str, e),
         }
     }
+
+    report_held_back(&held_back)?;
 
     // ============================================================================
     // COPY ARTIFACTS (settings, skills, agents, ...) AND WRITE IGNORE GUARD
@@ -604,6 +623,55 @@ pub fn push_history(
         modified: modified_count,
         unchanged: unchanged_count,
         skipped_no_cwd,
+        held_back: held_back.len(),
         artifacts: artifact_report,
     })
+}
+
+/// Whether the repository copy at `repo_path` holds entries the local
+/// transcript lacks (see `crate::branches::repository_is_ahead`).
+fn repository_is_ahead(local_path: &Path, repo_path: &Path) -> Result<bool> {
+    let repository = match fs::read(repo_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", repo_path.display())),
+    };
+    let local =
+        fs::read(local_path).with_context(|| format!("Failed to read {}", local_path.display()))?;
+    Ok(crate::branches::repository_is_ahead(
+        local_path,
+        &local,
+        &repository,
+    ))
+}
+
+/// Say which transcripts the push left alone, at every verbosity: a live
+/// session waits until it closes, any other one for a pull.
+fn report_held_back(held_back: &[&Path]) -> Result<()> {
+    if held_back.is_empty() {
+        return Ok(());
+    }
+    let live = crate::branches::live_session_ids(&claude_home_dir()?);
+    let is_live = |relative: &&&Path| {
+        crate::branches::owning_session_id(relative).is_some_and(|session| live.contains(session))
+    };
+    let live_count = held_back.iter().filter(is_live).count();
+    let other_count = held_back.len() - live_count;
+    if live_count > 0 {
+        println!(
+            "  {} Held back {live_count} live session(s); they sync once closed",
+            "⏸".yellow()
+        );
+    }
+    if other_count > 0 {
+        println!(
+            "  {} Held back {other_count} session(s) the sync repository has newer entries for; \
+             `claude-code-sync sync` pulls them first",
+            "⏸".yellow()
+        );
+    }
+    for relative in held_back {
+        log::info!("Held back {}", relative.display());
+    }
+    Ok(())
 }

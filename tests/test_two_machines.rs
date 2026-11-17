@@ -433,3 +433,130 @@ fn two_machines_with_different_homes_share_sessions_and_converge_after_diverging
         "nothing new to push"
     );
 }
+
+/// The repository's copy of a transcript, read from the bare remote.
+fn remote_transcript(remote: &Path, project: &str, session: &str) -> String {
+    let output = Command::new("git")
+        .args(["--git-dir", remote.to_str().unwrap()])
+        .args(["show", &format!("HEAD:projects/{project}/{session}.jsonl")])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+#[serial]
+fn a_live_session_is_never_pushed_over_a_turn_the_other_machine_added() {
+    let _env = EnvRestore::capture();
+    let tmp = TempDir::new().unwrap();
+    let remote = tmp.path().join("remote.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "--quiet", remote.to_str().unwrap()],
+    );
+    let laptop = Machine::new(tmp.path(), "A", "Users/mateo", &remote);
+    let desktop = Machine::new(tmp.path(), "B", "home/mateo", &remote);
+
+    let laptop_cwd = laptop.cwd("jarvis");
+    laptop.append(
+        "jarvis",
+        JARVIS,
+        &[
+            message(JARVIS, &laptop_cwd, "p1", None, 0, "hola"),
+            last_prompt(JARVIS, "p1"),
+        ],
+    );
+    laptop.sync();
+    desktop.sync();
+
+    // The session stays open on the laptop, which keeps writing to it...
+    let sessions = laptop.claude.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("4242.json"),
+        format!(
+            "{{\"pid\":{},\"sessionId\":\"{JARVIS}\",\"cwd\":{},\"status\":\"busy\"}}",
+            std::process::id(),
+            serde_json::to_string(&laptop_cwd).unwrap()
+        ),
+    )
+    .unwrap();
+    laptop.append(
+        "jarvis",
+        JARVIS,
+        &[
+            message(
+                JARVIS,
+                &laptop_cwd,
+                "a1",
+                Some("p1"),
+                9,
+                "turno del portatil",
+            ),
+            last_prompt(JARVIS, "a1"),
+        ],
+    );
+    // ...while the desktop adds a turn of its own and publishes it.
+    let desktop_cwd = desktop.cwd("jarvis");
+    desktop.append(
+        "jarvis",
+        JARVIS,
+        &[
+            message(
+                JARVIS,
+                &desktop_cwd,
+                "b1",
+                Some("p1"),
+                5,
+                "turno del sobremesa",
+            ),
+            last_prompt(JARVIS, "b1"),
+        ],
+    );
+    desktop.sync();
+    assert!(remote_transcript(&remote, "@proyectos@jarvis", JARVIS).contains("turno del sobremesa"));
+
+    // The laptop's sync defers the live session on the pull, and the push
+    // must not publish the laptop's copy over the desktop's turn.
+    let laptop_copy = fs::read(laptop.transcript("jarvis", JARVIS)).unwrap();
+    laptop.sync();
+    assert_eq!(
+        fs::read(laptop.transcript("jarvis", JARVIS)).unwrap(),
+        laptop_copy,
+        "a live session is not rewritten"
+    );
+    assert!(
+        remote_transcript(&remote, "@proyectos@jarvis", JARVIS).contains("turno del sobremesa"),
+        "the desktop's turn is still in the repository"
+    );
+
+    // Closed: the next syncs split it, and both turns survive everywhere.
+    fs::remove_file(sessions.join("4242.json")).unwrap();
+    for _ in 0..2 {
+        laptop.sync();
+        desktop.sync();
+    }
+    let on_laptop = laptop.transcripts("jarvis");
+    assert_eq!(on_laptop, desktop.transcripts("jarvis"));
+    let branch = branch_session_id(JARVIS, "a1");
+    let session = String::from_utf8_lossy(&on_laptop[&format!("{JARVIS}.jsonl")]).into_owned();
+    let parallel = String::from_utf8_lossy(&on_laptop[&format!("{branch}.jsonl")]).into_owned();
+    assert!(
+        session.contains("turno del sobremesa"),
+        "the older turn keeps the session"
+    );
+    assert!(
+        parallel.contains("turno del portatil"),
+        "the laptop's turn is its branch"
+    );
+
+    let remote_head = git(&remote, &["rev-parse", "HEAD"]);
+    laptop.sync();
+    desktop.sync();
+    assert_eq!(git(&remote, &["rev-parse", "HEAD"]), remote_head, "settled");
+}

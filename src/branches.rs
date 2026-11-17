@@ -225,6 +225,39 @@ fn split(
     }
 }
 
+/// Whether pushing the local transcript over the sync repository's copy
+/// would drop entries only the repository has: true when the repository
+/// copy holds entries the local file lacks, unless they already sit in this
+/// machine's parallel branch of the session (a pull that split it, keeping
+/// the local continuation as the session, moved them there).
+///
+/// Such a transcript belongs to a session a pull deferred (live here) or
+/// one this machine has not pulled yet; the push leaves the repository copy
+/// alone, and the next pull fast-forwards or splits it.
+pub fn repository_is_ahead(local_path: &Path, local: &[u8], repository: &[u8]) -> bool {
+    let session_id = local_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    match reconcile(session_id, local, repository) {
+        Reconciled::Same | Reconciled::KeepLocal => false,
+        Reconciled::Split {
+            winner: Side::Local,
+            branch_id,
+            branch,
+        } => {
+            let here = local_path.with_file_name(format!("{branch_id}.jsonl"));
+            !std::fs::read(here).is_ok_and(|existing| {
+                matches!(
+                    reconcile(&branch_id, &existing, &branch),
+                    Reconciled::Same | Reconciled::KeepLocal
+                )
+            })
+        }
+        Reconciled::TakeRemote | Reconciled::Combined(_) | Reconciled::Split { .. } => true,
+    }
+}
+
 /// The id of the session a branch of `session_id` becomes: UUIDv5 over the
 /// session and the first new message of the branch.
 pub fn branch_session_id(session_id: &str, first_new_uuid: &str) -> String {
@@ -859,6 +892,63 @@ mod tests {
         let live = live_session_ids(home.path());
         assert!(live.contains("live"));
         assert!(!live.contains("gone"));
+    }
+
+    #[test]
+    fn a_push_never_drops_entries_only_the_repository_has() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let local_path = dir.path().join(format!("{S}.jsonl"));
+        let local = with(
+            prefix(),
+            &[message("l1", Some("p2"), 9, "local"), last_prompt("l1")],
+        );
+        let behind = file(&prefix());
+        let other_turn = with(
+            prefix(),
+            &[message("r1", Some("p2"), 5, "remota"), last_prompt("r1")],
+        );
+
+        assert!(
+            !repository_is_ahead(&local_path, &local, &behind),
+            "the repository is behind"
+        );
+        assert!(!repository_is_ahead(&local_path, &local, &local));
+        assert!(
+            repository_is_ahead(&local_path, &behind, &other_turn),
+            "a turn this machine has not pulled"
+        );
+        assert!(
+            repository_is_ahead(&local_path, &local, &other_turn),
+            "a diverged copy this machine has not split"
+        );
+
+        // Once a pull split it and kept the local continuation as the
+        // session, the other turn lives in the branch here: push is safe.
+        let Reconciled::Split {
+            winner: Side::Remote,
+            ..
+        } = reconcile(S, &local, &other_turn)
+        else {
+            panic!("the remote turn is older, so it keeps the session");
+        };
+        let later_turn = with(
+            prefix(),
+            &[
+                message("r2", Some("p2"), 12, "remota tarde"),
+                last_prompt("r2"),
+            ],
+        );
+        let Reconciled::Split {
+            winner: Side::Local,
+            branch_id,
+            branch,
+        } = reconcile(S, &local, &later_turn)
+        else {
+            panic!("the local turn is older, so it keeps the session");
+        };
+        assert!(repository_is_ahead(&local_path, &local, &later_turn));
+        std::fs::write(dir.path().join(format!("{branch_id}.jsonl")), &branch).unwrap();
+        assert!(!repository_is_ahead(&local_path, &local, &later_turn));
     }
 
     #[test]
