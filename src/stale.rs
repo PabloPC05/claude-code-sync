@@ -258,17 +258,44 @@ fn live_elsewhere(session_id: &str, except: Option<u32>) -> bool {
         .any(|p| Some(p) != except)
 }
 
+/// How long a closing window waits for a running sync before it leaves the
+/// repair to the next one. The `SessionEnd` hook has 10 s; a `claude
+/// --continue` typed right after closing must already see the repaired chat.
+const ENDED_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// The sync lock, waiting up to `wait` for a running sync to finish.
+fn sync_lock_within(wait: std::time::Duration) -> Result<Option<crate::sync_lock::SyncLock>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(lock) = crate::sync_lock::SyncLock::try_acquire()? {
+            return Ok(Some(lock));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// SessionEnd: the window `pid` is closing. Removed from its markers; when
 /// no window is left behind on a chat, the transcript is repaired and the
 /// marker deleted.
 ///
 /// The repair needs the sync lock, so it never rewrites a file a pull is
-/// writing; when a sync is running it is left to the next one's [`sweep`].
+/// writing; it waits up to [`ENDED_LOCK_WAIT`] for a running sync, and past
+/// that leaves the repair to the next one's [`sweep`].
 pub fn ended(pid: u32) -> Result<()> {
     let dir = stale_dir()?;
     if !has_markers(&dir) {
         return Ok(());
     }
+    if !read_markers(&dir).iter().any(|m| m.pids.contains(&pid)) {
+        return Ok(());
+    }
+    // Sync lock first, marker lock second: the order a sync takes them in
+    // (its sweep and its marks run under the sync lock), so neither waits
+    // on the other.
+    let sync = sync_lock_within(ENDED_LOCK_WAIT)?;
     let _lock = MarkerLock::take()?;
     for mut marker in read_markers(&dir) {
         if !marker.pids.contains(&pid) {
@@ -277,12 +304,10 @@ pub fn ended(pid: u32) -> Result<()> {
         marker.pids.retain(|&p| p != pid && alive(p));
         let settled = marker.pids.is_empty()
             && !live_elsewhere(&marker.session_id, Some(pid))
-            && match crate::sync_lock::SyncLock::try_acquire()? {
-                Some(_sync) => {
-                    repair_marker(&marker)?;
-                    true
-                }
-                None => false,
+            && sync.is_some()
+            && {
+                repair_marker(&marker)?;
+                true
             };
         if settled {
             delete_marker(&dir, &marker.session_id);
