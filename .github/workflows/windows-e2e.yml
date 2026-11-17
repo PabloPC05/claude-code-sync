@@ -1,0 +1,32 @@
+name: Windows e2e
+
+# Two simulated Windows PCs sync through a local bare remote, then autosync is
+# installed, run through Task Scheduler and removed. See scripts/windows-e2e.ps1.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mateo, 'ci/**']
+
+jobs:
+  windows-e2e:
+    name: Windows e2e (two PCs + autosync)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --release
+
+      - name: End-to-end test
+        shell: pwsh
+        run: pwsh -File scripts/windows-e2e.ps1 -Exe target\release\claude-code-sync.exe
