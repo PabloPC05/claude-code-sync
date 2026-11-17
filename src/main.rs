@@ -332,7 +332,7 @@ enum Commands {
         action: HistoryAction,
     },
 
-    /// Sync automatically: on a timer, and whenever a Claude Code chat ends
+    /// Sync automatically: on a timer, after every turn and when a chat ends
     Autosync {
         #[command(subcommand)]
         action: AutosyncAction,
