@@ -30,13 +30,19 @@ pub const SYSTEMD_UNIT: &str = "claude-code-sync-autosync";
 /// The Task Scheduler task's name.
 pub const WINDOWS_TASK: &str = "claude-code-sync autosync";
 
-/// What the hook runs, after the executable: a detached `autosync run`, so
+/// What the hook runs after the binary: a detached `autosync run`, so
 /// closing a chat is never held up by a sync. Also how our hook is told
 /// apart from everyone else's.
-pub const HOOK_ARGUMENTS: &str = "autosync run --detach";
+pub const HOOK_ARGS: [&str; 3] = ["autosync", "run", "--detach"];
 
-/// Seconds Claude Code gives the hook; the detached launch takes far less.
-pub const HOOK_TIMEOUT_SECONDS: u64 = 30;
+/// The shell-form command line an earlier build of this fork wrote, still
+/// recognized so `install` replaces it and `uninstall` removes it.
+const LEGACY_HOOK_COMMAND_SUFFIX: &str = "autosync run --detach";
+
+/// Seconds Claude Code gives the hook. `SessionEnd` hooks share a 1.5 s
+/// budget unless one asks for more; the detached launch returns in
+/// milliseconds, and this only covers a slow disk.
+pub const HOOK_TIMEOUT_SECONDS: u64 = 10;
 
 /// The retention `autosync install` asks Claude Code for: it otherwise
 /// deletes transcripts older than 30 days on its own, on one machine.
@@ -340,7 +346,7 @@ pub fn crontab_line(layout: &Layout, interval_minutes: u32) -> String {
 /// The `.vbs` the Windows task runs: the binary, with no window at all.
 pub fn windows_vbs(layout: &Layout) -> String {
     // A VBScript string doubles its quotes; the outer pair quotes the path.
-    let command = format!("\"{}\" {HOOK_ARGUMENTS}", layout.exe_text()).replace('"', "\"\"");
+    let command = format!("\"{}\" {}", layout.exe_text(), HOOK_ARGS.join(" ")).replace('"', "\"\"");
     format!(
         "' claude-code-sync autosync: one sync, with no console window.\r\n\
          ' Written by `claude-code-sync autosync install`, removed by `autosync uninstall`.\r\n\
@@ -381,15 +387,17 @@ pub fn schtasks_create(layout: &Layout, interval_minutes: u32) -> PlannedCommand
     )
 }
 
-/// The command the `SessionEnd` hook runs, quoted for the shell Claude Code
-/// hands it to. On Windows the path uses forward slashes, which `cmd.exe`
-/// and Git Bash both take inside double quotes.
-pub fn hook_command(platform: Platform, exe: &Path) -> String {
-    let exe = exe.to_string_lossy();
-    match platform {
-        Platform::Windows => format!("\"{}\" {HOOK_ARGUMENTS}", exe.replace('\\', "/")),
-        Platform::MacOs | Platform::Linux => format!("{} {HOOK_ARGUMENTS}", shell_quote(&exe)),
-    }
+/// The `SessionEnd` hook, in Claude Code's exec form (2.1.139 and later):
+/// the binary's absolute path and its arguments, run without a shell. The
+/// same entry works on every OS — no quoting for Git Bash, `cmd.exe` or
+/// PowerShell to get wrong, whatever the path holds.
+pub fn hook_entry(exe: &Path) -> Value {
+    serde_json::json!({
+        "type": "command",
+        "command": exe.to_string_lossy(),
+        "args": HOOK_ARGS,
+        "timeout": HOOK_TIMEOUT_SECONDS,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -494,11 +502,18 @@ fn indent_continuation(pretty: &str) -> String {
     pretty.replace('\n', "\n  ")
 }
 
-/// Whether a hook entry is the one autosync installs.
+/// Whether a hook entry is one autosync installed: the exec form, or the
+/// shell form an earlier build wrote.
 fn is_our_hook(hook: &Value) -> bool {
-    hook.get("command")
+    let exec_form = hook
+        .get("args")
+        .and_then(|args| args.as_array())
+        .is_some_and(|args| args.iter().map(|a| a.as_str()).eq(HOOK_ARGS.map(Some)));
+    let shell_form = hook
+        .get("command")
         .and_then(|c| c.as_str())
-        .is_some_and(|c| c.contains(HOOK_ARGUMENTS))
+        .is_some_and(|c| c.trim_end().ends_with(LEGACY_HOOK_COMMAND_SUFFIX));
+    exec_form || shell_form
 }
 
 /// Remove autosync's hooks from a `hooks` object; returns whether any was.
@@ -527,12 +542,13 @@ fn remove_our_hooks(hooks: &mut serde_json::Map<String, Value>) -> bool {
 
 /// `settings.json` after an install: the retention raised to
 /// [`RETENTION_DAYS`] when lower or missing, and — unless `hook` is `None`
-/// (`--no-hooks`) — exactly one `SessionEnd` hook of ours running `hook`.
+/// (`--no-hooks`) — exactly one `SessionEnd` hook of ours running the
+/// binary at `hook` (see [`hook_entry`]).
 /// Every other member, and every other hook, is left as it was. `None` when
 /// nothing changes; otherwise the new text and what changed.
 pub fn settings_after_install(
     original: Option<&str>,
-    hook: Option<&str>,
+    hook: Option<&Path>,
 ) -> Result<Option<(String, Vec<String>)>> {
     let mut settings = Settings::parse(original)?;
     let mut changes = Vec::new();
@@ -560,14 +576,8 @@ pub fn settings_after_install(
         None => serde_json::Map::new(),
     };
     let removed = remove_our_hooks(&mut hooks);
-    if let Some(command) = hook {
-        let ours = serde_json::json!({
-            "hooks": [{
-                "type": "command",
-                "command": command,
-                "timeout": HOOK_TIMEOUT_SECONDS,
-            }]
-        });
+    if let Some(exe) = hook {
+        let ours = serde_json::json!({ "hooks": [hook_entry(exe)] });
         let groups = hooks
             .entry("SessionEnd")
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -586,9 +596,10 @@ pub fn settings_after_install(
         } else {
             settings.set("hooks", &Value::Object(hooks));
         }
+        let runs = |exe: &Path| format!("{} {}", exe.display(), HOOK_ARGS.join(" "));
         changes.push(match (hook, removed) {
-            (Some(command), false) => format!("SessionEnd hook added: {command}"),
-            (Some(command), true) => format!("SessionEnd hook updated: {command}"),
+            (Some(exe), false) => format!("SessionEnd hook added: {}", runs(exe)),
+            (Some(exe), true) => format!("SessionEnd hook updated: {}", runs(exe)),
             (None, _) => "SessionEnd hook removed (--no-hooks)".to_string(),
         });
     }
@@ -696,8 +707,8 @@ pub fn install_plan(
                 .push(schtasks_create(layout, interval_minutes));
         }
     }
-    let hook = hooks.then(|| hook_command(layout.platform, &layout.exe));
-    plan.settings = settings_after_install(settings_text, hook.as_deref())?;
+    let hook = hooks.then_some(layout.exe.as_path());
+    plan.settings = settings_after_install(settings_text, hook)?;
     Ok(plan)
 }
 
@@ -1091,21 +1102,26 @@ fn spawn_detached() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("Failed to open {}", log_path.display()))?;
 
-    let mut command = std::process::Command::new(&layout.exe);
-    command
-        .args(["autosync", "run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    detach(&mut command);
-    command
-        .spawn()
+    let spawn = |leave_job: bool| -> std::io::Result<std::process::Child> {
+        let mut command = std::process::Command::new(&layout.exe);
+        command
+            .args(["autosync", "run"])
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log.try_clone()?);
+        detach(&mut command, leave_job);
+        command.spawn()
+    };
+    // Leaving the parent's job object is refused when the job forbids it;
+    // then the child stays in it, as any other would.
+    spawn(true)
+        .or_else(|_| spawn(false))
         .with_context(|| format!("Failed to start {}", layout.exe.display()))?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn detach(command: &mut std::process::Command) {
+fn detach(command: &mut std::process::Command, _leave_job: bool) {
     use std::os::unix::process::CommandExt;
     // Its own session: closing the terminal or ending Claude Code does not
     // take the sync down with it.
@@ -1119,16 +1135,28 @@ fn detach(command: &mut std::process::Command) {
 }
 
 #[cfg(windows)]
-fn detach(command: &mut std::process::Command) {
+fn detach(command: &mut std::process::Command, leave_job: bool) {
     use std::os::windows::process::CommandExt;
-    // A console with no window, inherited by git: nothing flashes on screen.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Its own console, with no window, and its own process group: Claude
+    // Code's console closing or a Ctrl+C there never reaches it, and the git
+    // it starts inherits the windowless console, so nothing flashes on
+    // screen. Not DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW beside
+    // it, and a process with no console makes every console program it
+    // starts (git, at each step of a sync) open a window of its own.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+    if leave_job {
+        // Out of a job Claude Code may run its hooks in, which can be set
+        // to end every process in it when Claude Code exits.
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+    command.creation_flags(flags);
 }
 
 #[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut std::process::Command) {}
+fn detach(_command: &mut std::process::Command, _leave_job: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -1343,21 +1371,23 @@ mod tests {
     }
 
     #[test]
-    fn the_hook_command_is_quoted_for_each_shell() {
+    fn the_hook_runs_the_binary_without_a_shell() {
+        let exe =
+            r"C:\Users\Mateo Bodenlle\AppData\Local\Programs\claude-code-sync\claude-code-sync.exe";
         assert_eq!(
-            hook_command(
-                Platform::Windows,
-                Path::new(r"C:\Users\Mateo Bodenlle\AppData\Local\Programs\claude-code-sync\claude-code-sync.exe")
-            ),
-            "\"C:/Users/Mateo Bodenlle/AppData/Local/Programs/claude-code-sync/claude-code-sync.exe\" \
-             autosync run --detach"
+            hook_entry(Path::new(exe)),
+            serde_json::json!({
+                "type": "command",
+                "command": exe,
+                "args": ["autosync", "run", "--detach"],
+                "timeout": 10,
+            })
         );
+        let unusual = "/home/o'neil/Iñaki $HOME/claude-code-sync";
         assert_eq!(
-            hook_command(
-                Platform::Linux,
-                Path::new("/home/o'neil/bin/claude-code-sync")
-            ),
-            r"'/home/o'\''neil/bin/claude-code-sync' autosync run --detach"
+            hook_entry(Path::new(unusual))["command"],
+            unusual,
+            "the path as it is: nothing to quote without a shell"
         );
     }
 
@@ -1396,6 +1426,7 @@ mod tests {
 }
 "#;
 
+    /// Each `SessionEnd` hook as one line: its command, then its arguments.
     fn hook_commands(text: &str) -> Vec<String> {
         let value: Value = serde_json::from_str(text).unwrap();
         value["hooks"]["SessionEnd"]
@@ -1404,7 +1435,14 @@ mod tests {
                 groups
                     .iter()
                     .flat_map(|g| g["hooks"].as_array().unwrap().iter())
-                    .map(|h| h["command"].as_str().unwrap().to_string())
+                    .map(|h| {
+                        let mut line = h["command"].as_str().unwrap().to_string();
+                        for arg in h["args"].as_array().into_iter().flatten() {
+                            line.push(' ');
+                            line.push_str(arg.as_str().unwrap());
+                        }
+                        line
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1412,17 +1450,19 @@ mod tests {
 
     #[test]
     fn the_install_adds_one_hook_beside_the_others_and_keeps_transcripts() {
-        let ours = "'/x/claude-code-sync' autosync run --detach";
+        let ours = Path::new("/x/claude-code-sync");
         let (text, changes) = settings_after_install(Some(EXISTING), Some(ours))
             .unwrap()
             .unwrap();
 
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["cleanupPeriodDays"], 3650);
-        assert_eq!(hook_commands(&text), vec!["say bye", ours]);
+        assert_eq!(
+            hook_commands(&text),
+            vec!["say bye", "/x/claude-code-sync autosync run --detach"]
+        );
         let added = &value["hooks"]["SessionEnd"][1]["hooks"][0];
-        assert_eq!(added["type"], "command");
-        assert_eq!(added["timeout"], HOOK_TIMEOUT_SECONDS);
+        assert_eq!(added, &hook_entry(ours), "the exec form, no shell");
         assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
         assert_eq!(value["model"], "opus");
         assert_eq!(changes.len(), 2, "{changes:?}");
@@ -1451,11 +1491,14 @@ mod tests {
             settings_after_install(Some(&text), Some(ours)).unwrap(),
             None
         );
-        let moved = "'/y/claude-code-sync' autosync run --detach";
+        let moved = Path::new("/y/claude-code-sync");
         let (moved_text, _) = settings_after_install(Some(&text), Some(moved))
             .unwrap()
             .unwrap();
-        assert_eq!(hook_commands(&moved_text), vec!["say bye", moved]);
+        assert_eq!(
+            hook_commands(&moved_text),
+            vec!["say bye", "/y/claude-code-sync autosync run --detach"]
+        );
 
         // Uninstall removes ours only and leaves the retention raised.
         let (after, _) = settings_after_uninstall(Some(&text)).unwrap().unwrap();
@@ -1470,6 +1513,45 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_form_an_earlier_build_wrote_is_replaced_and_removed() {
+        let legacy = r#"{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/x/claude-code-sync' autosync run --detach",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "say bye"
+          }
+        ]
+      }
+    ]
+  },
+  "cleanupPeriodDays": 3650
+}
+"#;
+        let (installed, changes) =
+            settings_after_install(Some(legacy), Some(Path::new("/x/claude-code-sync")))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            hook_commands(&installed),
+            vec!["say bye", "/x/claude-code-sync autosync run --detach"]
+        );
+        assert!(changes[0].contains("updated"), "{changes:?}");
+
+        let (uninstalled, _) = settings_after_uninstall(Some(legacy)).unwrap().unwrap();
+        assert_eq!(hook_commands(&uninstalled), vec!["say bye"]);
+        let (both_gone, _) = settings_after_uninstall(Some(&installed)).unwrap().unwrap();
+        assert_eq!(hook_commands(&both_gone), vec!["say bye"]);
+    }
+
+    #[test]
     fn a_longer_retention_is_left_alone_and_no_hooks_still_raises_a_short_one() {
         let long = "{\n  \"cleanupPeriodDays\": 5000\n}\n";
         assert_eq!(settings_after_install(Some(long), None).unwrap(), None);
@@ -1478,19 +1560,19 @@ mod tests {
         assert_eq!(text, "{\n  \"cleanupPeriodDays\": 3650\n}");
         assert_eq!(changes.len(), 1, "{changes:?}");
 
-        let (fresh, _) = settings_after_install(None, Some("x autosync run --detach"))
+        let (fresh, _) = settings_after_install(None, Some(Path::new("/x")))
             .unwrap()
             .unwrap();
         let value: Value = serde_json::from_str(&fresh).unwrap();
         assert_eq!(value["cleanupPeriodDays"], 3650);
-        assert_eq!(hook_commands(&fresh), vec!["x autosync run --detach"]);
+        assert_eq!(hook_commands(&fresh), vec!["/x autosync run --detach"]);
     }
 
     #[test]
     fn a_byte_order_mark_is_dropped_and_no_hooks_removes_ours() {
         let with_ours = settings_after_install(
             Some("\u{feff}{\"cleanupPeriodDays\": 3650}"),
-            Some("x autosync run --detach"),
+            Some(Path::new("/x")),
         )
         .unwrap()
         .unwrap()
@@ -1507,6 +1589,6 @@ mod tests {
     #[test]
     fn a_settings_file_that_is_not_an_object_is_refused() {
         assert!(settings_after_install(Some("[1]"), None).is_err());
-        assert!(settings_after_install(Some("{\"hooks\": 3}"), Some("x")).is_err());
+        assert!(settings_after_install(Some("{\"hooks\": 3}"), Some(Path::new("/x"))).is_err());
     }
 }

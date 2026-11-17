@@ -194,14 +194,25 @@ without touching anything.
 | Windows | Task Scheduler task "claude-code-sync autosync" every N minutes for the current user, running `wscript.exe "<config dir>\autosync.vbs"` (UTF-16, window style 0: no console ever flashes) | `<config dir>\autosync.log` |
 
 The hook is merged into `~/.claude/settings.json` beside any hooks you already
-have, using Claude Code's schema
-(`"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "...", "timeout": 30}]}]}`),
-and runs `<binary> autosync run --detach`, which starts the sync in its own
-process group and returns at once. The same edit raises `cleanupPeriodDays` to
-3650 when it is missing or lower (also with `--no-hooks`): Claude Code
-otherwise deletes transcripts older than 30 days on its own. Other members keep
-their order and text; the file is written as UTF-8 without BOM. `uninstall`
-removes only autosync's hook, and leaves `cleanupPeriodDays` alone.
+have, in Claude Code's exec form (Claude Code 2.1.139 or later), which runs the
+binary without a shell on every OS — nothing for Git Bash, `cmd.exe` or
+PowerShell to misquote:
+
+```json
+"hooks": {"SessionEnd": [{"hooks": [{"type": "command",
+  "command": "C:\\Users\\Mateo\\AppData\\Local\\Programs\\claude-code-sync\\claude-code-sync.exe",
+  "args": ["autosync", "run", "--detach"], "timeout": 10}]}]}
+```
+
+`--detach` starts the sync in its own session (Unix) or its own windowless
+console and process group (Windows) and returns within milliseconds, well inside
+the 1.5 s `SessionEnd` budget; the sync carries on after Claude Code exits. The
+same edit raises `cleanupPeriodDays` to 3650 when it is missing or lower (also
+with `--no-hooks`): Claude Code otherwise deletes transcripts older than 30 days
+on its own. Other members keep their order and text; the file is written as
+UTF-8 without BOM. `uninstall` removes only autosync's hook (in either the exec
+form or the shell form earlier builds wrote), and leaves `cleanupPeriodDays`
+alone.
 
 `autosync run` never prompts, exits 0 when there is nothing to do, and takes an
 exclusive lock on `sync.lock` in the config directory: when the timer and the
