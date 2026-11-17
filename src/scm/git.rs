@@ -78,6 +78,18 @@ impl GitScm {
             ));
         }
 
+        // Same repository-local identity `init` sets: a machine whose git has
+        // no user.name/user.email (a fresh Windows install, a CI runner) could
+        // otherwise clone but never commit.
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Claude Code Sync"])
+            .current_dir(path)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "claude-code-sync@local"])
+            .current_dir(path)
+            .output();
+
         Self::open(path)
     }
 
@@ -524,6 +536,42 @@ mod tests {
         // Check branch (default is master or main depending on git config)
         let branch = scm.current_branch().unwrap();
         assert!(!branch.is_empty());
+    }
+
+    #[test]
+    fn a_clone_can_commit_without_a_global_git_identity() {
+        let temp = TempDir::new().unwrap();
+        let remote = temp.path().join("remote.git");
+        git_in(temp.path(), &["init", "--bare", &remote.to_string_lossy()]);
+
+        let clone_dir = temp.path().join("clone");
+        let clone = GitScm::clone(&remote.to_string_lossy(), &clone_dir).unwrap();
+
+        let local = |key: &str| {
+            let out = Command::new("git")
+                .args(["config", "--local", key])
+                .current_dir(&clone_dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(local("user.name"), "Claude Code Sync");
+        assert_eq!(local("user.email"), "claude-code-sync@local");
+
+        // With only configured identities allowed (as on a machine with no
+        // global git identity), the clone still commits.
+        std::fs::write(clone_dir.join("a.txt"), "a").unwrap();
+        clone.stage_all().unwrap();
+        let out = Command::new("git")
+            .args(["-c", "user.useConfigOnly=true", "commit", "-m", "first"])
+            .current_dir(&clone_dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
