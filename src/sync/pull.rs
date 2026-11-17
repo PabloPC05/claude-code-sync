@@ -28,7 +28,7 @@ use super::MAX_CONVERSATIONS_TO_DISPLAY;
 /// interior session id — a session resumed in another project, and every
 /// subagent of a session — are different conversations living in different
 /// files, and only the file says which copy is which.
-fn local_destination(
+pub(crate) fn local_destination(
     remote_session: &ConversationSession,
     remote_projects_dir: &Path,
     claude_dir: &Path,
@@ -266,6 +266,29 @@ fn settle_transcript_conflict(
     Ok(Some(scm::ConflictChoice::WriteMerged(merged)))
 }
 
+/// The sync repository's transcripts this machine takes, judged by the
+/// include and exclude patterns at the place each would land here: the
+/// patterns are written for this machine's paths, and a repository
+/// directory named by a root or a project id spells the project otherwise.
+/// One with no place here is judged by its repository path, so the pull
+/// can name it among the unmapped ones.
+pub(crate) fn discover_repo_sessions(
+    remote_projects_dir: &Path,
+    claude_dir: &Path,
+    filter: &FilterConfig,
+) -> Result<Vec<ConversationSession>> {
+    let sessions = discover_sessions(remote_projects_dir, &filter.without_path_patterns())?;
+    Ok(sessions
+        .into_iter()
+        .filter(|session| {
+            match local_destination(session, remote_projects_dir, claude_dir, filter) {
+                Some(destination) => filter.patterns_select(claude_dir, &destination),
+                None => filter.patterns_select(remote_projects_dir, &session.file_path),
+            }
+        })
+        .collect())
+}
+
 fn settle_conflict(
     file: &scm::ConflictedFile,
     can_ask: bool,
@@ -376,7 +399,7 @@ pub fn pull_history(
     // Discover remote sessions
     let remote_projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
     println!("  {} remote sessions...", "Discovering".cyan());
-    let remote_sessions = discover_sessions(&remote_projects_dir, &filter)?;
+    let remote_sessions = discover_repo_sessions(&remote_projects_dir, &claude_dir, &filter)?;
     println!(
         "  {} {} remote sessions",
         "Found".green(),

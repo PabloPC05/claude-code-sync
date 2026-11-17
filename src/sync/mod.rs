@@ -9,6 +9,7 @@ mod status;
 
 // Re-export public types and functions
 pub use init::{init_from_onboarding, init_sync_repo};
+pub(crate) use pull::discover_repo_sessions;
 pub use pull::pull_history;
 pub use push::push_history;
 pub use remote::{remove_remote, set_remote, show_remote};

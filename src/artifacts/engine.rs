@@ -485,6 +485,13 @@ fn collect(
                 if extension_excluded(desc, abs) {
                     continue;
                 }
+                // A project's files travel with it: a session's sidecar
+                // when the session's transcript is selected, the rest when
+                // the project is. Left out without a count, like the
+                // transcripts the patterns leave out.
+                if desc.dest == DestRoot::SessionTree && !filter.in_scope(&base, abs) {
+                    continue;
+                }
                 let mut rel = abs.strip_prefix(&base).unwrap_or(abs).to_path_buf();
                 // Attachments take the project's repo-side directory name,
                 // mirroring session layout.
@@ -1509,6 +1516,14 @@ fn collect_repo_files(
     files
 }
 
+/// `~/.claude/projects`, or wherever a session-tree category reads from.
+fn session_tree_root(desc: &CategoryDescriptor, claude_dir: &Path) -> PathBuf {
+    match desc.source {
+        SourceSpec::Dir(dir) => claude_dir.join(dir),
+        SourceSpec::Files(_) => claude_dir.to_path_buf(),
+    }
+}
+
 /// Why a repo file has no local destination. The caller reports the two cases
 /// differently: an unmapped project is one warning for all of its files, an
 /// unrestorable path is a refusal worth its own line.
@@ -1664,7 +1679,21 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
         }
         for (repo_path, rel) in collected {
             let local_path = match local_destination(desc, claude_dir, &rel, filter) {
+                // The include and exclude patterns judge a project's files
+                // where they would land, the way its transcripts are judged.
+                Ok(local_path)
+                    if desc.dest == DestRoot::SessionTree
+                        && !filter
+                            .patterns_select(&session_tree_root(desc, claude_dir), &local_path) =>
+                {
+                    continue;
+                }
                 Ok(local_path) => local_path,
+                Err(SkipReason::UnmappedProject(_))
+                    if !filter.patterns_select(&category_root, &repo_path) =>
+                {
+                    continue;
+                }
                 Err(SkipReason::UnmappedProject(project)) => {
                     plan.skipped += 1;
                     plan.unmapped_projects

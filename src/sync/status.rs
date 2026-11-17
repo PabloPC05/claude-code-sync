@@ -76,7 +76,8 @@ pub fn show_status(show_conflicts: bool, show_files: bool, held_back: bool) -> R
     let remote_projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
     let mut skipped_by_project = crate::project_map::SkippedByProject::new();
     if remote_projects_dir.exists() {
-        let remote_sessions = discover_sessions(&remote_projects_dir, &filter)?;
+        let remote_sessions =
+            super::discover_repo_sessions(&remote_projects_dir, &claude_dir, &filter)?;
         println!("  Sync repo: {}", remote_sessions.len().to_string().cyan());
         skipped_by_project = sessions_without_local_project(
             &filter,

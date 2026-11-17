@@ -109,8 +109,10 @@ pub fn plan_push(
     projects_dir: &Path,
     filter: &FilterConfig,
 ) -> Result<PushPlan> {
+    // Only to tell added from modified: the patterns are written for this
+    // machine's paths, not the repository's, and must not hide a copy.
     let existing_sessions = if projects_dir.exists() {
-        discover_sessions(projects_dir, filter)?
+        discover_sessions(projects_dir, &filter.without_path_patterns())?
     } else {
         Vec::new()
     };

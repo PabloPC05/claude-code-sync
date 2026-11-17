@@ -60,12 +60,13 @@ pub fn discover_sessions(
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .filter(|path| {
-            let included = filter.should_include(path);
-            if !included {
+        .filter(|path| match transcript_verdict(base_path, path, filter) {
+            Verdict::Included => true,
+            Verdict::OutOfScope => false,
+            Verdict::TooLarge => {
                 warn_oversized(path, filter.max_file_size_bytes);
+                false
             }
-            included
         })
         .collect();
 
@@ -81,6 +82,30 @@ pub fn discover_sessions(
         .collect();
 
     Ok(sessions)
+}
+
+/// What discovery does with one transcript.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Included,
+    /// Outside the include/exclude patterns or the age filter: left out
+    /// without a word, as the user asked.
+    OutOfScope,
+    /// Selected, but over the size limit: left out, and said so.
+    TooLarge,
+}
+
+/// Filter first, then size: a transcript of a project the patterns leave
+/// out is not reported for its size. A subagent transcript follows its
+/// session's (see `filter::pattern_subject`).
+fn transcript_verdict(base_path: &Path, path: &Path, filter: &FilterConfig) -> Verdict {
+    if !filter.in_scope(base_path, path) {
+        return Verdict::OutOfScope;
+    }
+    if !filter.within_size_limit(path) {
+        return Verdict::TooLarge;
+    }
+    Verdict::Included
 }
 
 /// Say that a conversation was left out for being over the size limit.
@@ -245,6 +270,31 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn an_excluded_project_is_left_out_before_its_size_is_looked_at() {
+        let temp_dir = tempdir().unwrap();
+        let projects = temp_dir.path();
+        for project in ["-w-kept", "-w-other"] {
+            fs::create_dir_all(projects.join(project)).unwrap();
+            fs::write(projects.join(project).join("s.jsonl"), "x".repeat(100)).unwrap();
+        }
+        let filter = FilterConfig {
+            include_patterns: vec!["*-w-kept*".to_string()],
+            max_file_size_bytes: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            transcript_verdict(projects, &projects.join("-w-other/s.jsonl"), &filter),
+            Verdict::OutOfScope,
+            "no size warning for a project the patterns leave out"
+        );
+        assert_eq!(
+            transcript_verdict(projects, &projects.join("-w-kept/s.jsonl"), &filter),
+            Verdict::TooLarge
+        );
+    }
 
     #[test]
     fn test_extract_project_name_basic() {

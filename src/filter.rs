@@ -245,55 +245,71 @@ impl FilterConfig {
             }
         }
 
-        // Check file size
-        if let Ok(metadata) = fs::metadata(file_path) {
-            if metadata.len() > self.max_file_size_bytes {
-                return false;
-            }
+        self.within_size_limit(file_path)
+            && self.matches_path_patterns(file_path)
+            && self.recent_enough(file_path)
+    }
+
+    /// Whether a file fits under `max_file_size_bytes` (an unreadable one
+    /// does, as before: the reader reports it).
+    pub fn within_size_limit(&self, file_path: &Path) -> bool {
+        fs::metadata(file_path).map_or(true, |m| m.len() <= self.max_file_size_bytes)
+    }
+
+    /// Whether a path passes the exclude patterns and, when there are any,
+    /// the include patterns.
+    pub fn matches_path_patterns(&self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        if self
+            .exclude_patterns
+            .iter()
+            .any(|pattern| glob_match(pattern, &path_str))
+        {
+            return false;
         }
+        self.include_patterns.is_empty()
+            || self
+                .include_patterns
+                .iter()
+                .any(|pattern| glob_match(pattern, &path_str))
+    }
 
-        let path_str = file_path.to_string_lossy();
+    /// Whether a file was modified within `exclude_older_than_days`.
+    fn recent_enough(&self, file_path: &Path) -> bool {
+        let Some(max_days) = self.exclude_older_than_days else {
+            return true;
+        };
+        let Ok(modified) = fs::metadata(file_path).and_then(|m| m.modified()) else {
+            return true;
+        };
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        age <= std::time::Duration::from_secs(u64::from(max_days) * 24 * 60 * 60)
+    }
 
-        // Check exclude patterns first
-        if !self.exclude_patterns.is_empty() {
-            for pattern in &self.exclude_patterns {
-                if glob_match(pattern, &path_str) {
-                    return false;
-                }
-            }
+    /// Whether a file inside a project directory under `projects_dir` is
+    /// within what the include and exclude patterns select, judged the way
+    /// the transcript it belongs to is: see [`pattern_subject`].
+    pub fn patterns_select(&self, projects_dir: &Path, file: &Path) -> bool {
+        self.matches_path_patterns(&pattern_subject(projects_dir, file))
+    }
+
+    /// [`patterns_select`](Self::patterns_select), and the age filter where
+    /// it applies: on the transcript a file belongs to, when it is here.
+    pub fn in_scope(&self, projects_dir: &Path, file: &Path) -> bool {
+        let subject = pattern_subject(projects_dir, file);
+        self.matches_path_patterns(&subject) && (!subject.is_file() || self.recent_enough(&subject))
+    }
+
+    /// This configuration with no include or exclude patterns: for reading
+    /// a tree whose paths are not the ones the patterns are written for.
+    pub fn without_path_patterns(&self) -> FilterConfig {
+        FilterConfig {
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            ..self.clone()
         }
-
-        // Check include patterns (if any are specified)
-        if !self.include_patterns.is_empty() {
-            let mut matches_include = false;
-            for pattern in &self.include_patterns {
-                if glob_match(pattern, &path_str) {
-                    matches_include = true;
-                    break;
-                }
-            }
-            if !matches_include {
-                return false;
-            }
-        }
-
-        // Check age filter
-        if let Some(max_days) = self.exclude_older_than_days {
-            if let Ok(metadata) = fs::metadata(file_path) {
-                if let Ok(modified) = metadata.modified() {
-                    let age = std::time::SystemTime::now()
-                        .duration_since(modified)
-                        .unwrap_or_default();
-
-                    let max_age = std::time::Duration::from_secs((max_days as u64) * 24 * 60 * 60);
-                    if age > max_age {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
     }
 
     /// Get the configured SCM backend.
@@ -350,6 +366,35 @@ impl FilterConfig {
         crate::project_map::validate_roots(&self.root_map)?;
         Ok(())
     }
+}
+
+/// The path the include and exclude patterns are matched against for a file
+/// inside a project directory under `projects_dir`: a session transcript is
+/// its own subject; whatever sits in a session's directory (`<session>/`:
+/// tool results, subagents) follows that session's transcript; the
+/// project's other files (`memory/`, images) follow the project directory,
+/// written with a trailing separator. So a session's attachments travel
+/// exactly when it does, and a project's memory when the project does.
+pub fn pattern_subject(projects_dir: &Path, file: &Path) -> PathBuf {
+    let Ok(relative) = file.strip_prefix(projects_dir) else {
+        return file.to_path_buf();
+    };
+    let mut parts = relative.components();
+    let (Some(project), Some(first)) = (parts.next(), parts.next()) else {
+        return file.to_path_buf();
+    };
+    let project_dir = projects_dir.join(project);
+    let first = first.as_os_str().to_string_lossy();
+    let directly_inside = parts.as_path().as_os_str().is_empty();
+    if directly_inside && first.ends_with(".jsonl") {
+        return file.to_path_buf();
+    }
+    if !directly_inside && uuid::Uuid::parse_str(&first).is_ok() {
+        return project_dir.join(format!("{first}.jsonl"));
+    }
+    let mut directory = project_dir.into_os_string();
+    directory.push(std::path::MAIN_SEPARATOR_STR);
+    PathBuf::from(directory)
 }
 
 /// Simple glob pattern matching
@@ -1016,6 +1061,63 @@ mod tests {
             !broken.should_include(&file),
             "a 0-byte limit excludes every non-empty file — this is the damage"
         );
+    }
+
+    #[test]
+    fn a_projects_files_are_judged_by_the_transcript_they_belong_to() {
+        let projects = Path::new("/c/projects");
+        let session = "0b9a8c3e-58f4-4b47-9d43-3a1f6f2d7e10";
+        let transcript = projects.join("-p-a").join(format!("{session}.jsonl"));
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
+        assert_eq!(pattern_subject(projects, &transcript), transcript);
+        assert_eq!(
+            pattern_subject(
+                projects,
+                &projects
+                    .join("-p-a")
+                    .join(session)
+                    .join("tool-results/x.txt")
+            ),
+            transcript
+        );
+        assert_eq!(
+            pattern_subject(
+                projects,
+                &projects
+                    .join("-p-a")
+                    .join(session)
+                    .join("subagents/agent-1.jsonl")
+            ),
+            transcript
+        );
+        assert_eq!(
+            pattern_subject(projects, &projects.join("-p-a/memory/MEMORY.md")),
+            PathBuf::from(format!("{}{sep}", projects.join("-p-a").display()))
+        );
+        assert_eq!(
+            pattern_subject(projects, &projects.join("-p-a/diagram.png")),
+            PathBuf::from(format!("{}{sep}", projects.join("-p-a").display()))
+        );
+
+        let only_a = FilterConfig {
+            include_patterns: vec!["*-p-a*".to_string()],
+            ..Default::default()
+        };
+        assert!(only_a.patterns_select(projects, &projects.join("-p-a/memory/MEMORY.md")));
+        assert!(!only_a.patterns_select(projects, &projects.join("-p-b/memory/MEMORY.md")));
+        let not_b = FilterConfig {
+            exclude_patterns: vec!["*-p-b/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!not_b.patterns_select(
+            projects,
+            &projects
+                .join("-p-b")
+                .join(session)
+                .join("tool-results/x.txt")
+        ));
+        assert!(not_b.patterns_select(projects, &projects.join("-p-a/x.png")));
     }
 
     #[test]

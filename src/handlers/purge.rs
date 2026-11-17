@@ -21,7 +21,8 @@ pub fn handle_purge(older_than_days: Option<u32>, dry_run: bool, assume_yes: boo
     let configured = older_than_days.or(filter.purge_older_than_days);
     let days = purge::retention_days(&claude_dir, configured);
 
-    let plan = purge::plan(
+    let plan = plan_in_scope(
+        &filter,
         &claude_projects_dir()?,
         &state.sync_repo_path.join(&filter.sync_subdirectory),
         days,
@@ -49,6 +50,47 @@ pub fn handle_purge(older_than_days: Option<u32>, dry_run: bool, assume_yes: boo
     Ok(())
 }
 
+/// [`purge::plan`] limited to the sessions the include and exclude patterns
+/// select: a project left out of sync is left alone by its purge too. A
+/// local copy is judged where it is; a repository copy where it would land
+/// on this machine.
+fn plan_in_scope(
+    filter: &FilterConfig,
+    claude_projects: &Path,
+    repo_projects: &Path,
+    days: u32,
+) -> Result<PurgePlan> {
+    let mut plan = purge::plan(claude_projects, repo_projects, days)?;
+    if filter.include_patterns.is_empty() && filter.exclude_patterns.is_empty() {
+        return Ok(plan);
+    }
+    let selected = |path: &Path| -> bool {
+        if path.starts_with(claude_projects) {
+            return filter.patterns_select(claude_projects, path);
+        }
+        let Ok(relative) = path.strip_prefix(repo_projects) else {
+            return false;
+        };
+        let local =
+            crate::project_map::split_project_path(relative).and_then(|(project, inside)| {
+                crate::project_map::local_project_dir(filter, claude_projects, project)
+                    .map(|dir| dir.join(inside))
+            });
+        match local {
+            Some(local) => filter.patterns_select(claude_projects, &local),
+            None => filter.patterns_select(repo_projects, path),
+        }
+    };
+    plan.targets.retain(|target| {
+        target
+            .paths
+            .iter()
+            .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+            .any(|path| selected(path))
+    });
+    Ok(plan)
+}
+
 /// Purge as part of a sync, when the user has turned that on. There is no
 /// prompt — enabling `purge_after_sync` is the consent — and the removals are
 /// left staged for the push that follows.
@@ -58,7 +100,8 @@ pub fn purge_after_sync(filter: &FilterConfig, repo_root: &Path) -> Result<()> {
     }
     let claude_dir = crate::sync::discovery::claude_home_dir()?;
     let days = purge::retention_days(&claude_dir, filter.purge_older_than_days);
-    let plan = purge::plan(
+    let plan = plan_in_scope(
+        filter,
         &claude_projects_dir()?,
         &repo_root.join(&filter.sync_subdirectory),
         days,
