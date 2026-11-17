@@ -177,6 +177,13 @@ pub fn push_history(
         println!("{}", "Pushing Claude Code history...".cyan().bold());
     }
 
+    // Chats of windows that closed on an out-of-date version are repaired
+    // first (a no-op when a pull just did it): the push then publishes the
+    // repaired file and the parallel session the repair made.
+    if let Err(e) = crate::stale::sweep() {
+        log::warn!("Could not repair the chats of closed windows: {e:#}");
+    }
+
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
     let merge_is_unfinished = repo.has_unfinished_merge();

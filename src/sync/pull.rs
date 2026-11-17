@@ -102,6 +102,13 @@ impl<'a> BranchWriter<'a> {
     }
 
     /// Whether the file (relative to the projects directory) belongs to a
+    /// session running here.
+    fn is_live(&self, relative: &Path) -> bool {
+        crate::branches::owning_session_id(relative)
+            .is_some_and(|session| self.live.contains(session))
+    }
+
+    /// Whether the file (relative to the projects directory) belongs to a
     /// session running here; if so it is remembered as deferred.
     fn defer_if_live(&mut self, relative: &Path) -> bool {
         match crate::branches::owning_session_id(relative) {
@@ -111,6 +118,58 @@ impl<'a> BranchWriter<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Fast-forward a transcript of a session running here by appending the
+    /// entries the repository's copy added (see
+    /// `crate::branches::live_fast_forward`), and mark the windows that hold
+    /// the session as out of date. `false` when it is not a plain
+    /// fast-forward or the append failed: the session is deferred, as before.
+    fn fast_forward_live(
+        &mut self,
+        conflict: &mut crate::conflict::Conflict,
+        relative: &Path,
+        claude_home: &Path,
+    ) -> bool {
+        let Some(session_id) = crate::branches::top_level_session_id(relative) else {
+            return false;
+        };
+        let (Ok(local), Ok(remote)) = (
+            std::fs::read(&conflict.local_file),
+            std::fs::read(&conflict.remote_file),
+        ) else {
+            return false;
+        };
+        let Some(appended) = crate::branches::live_fast_forward(&local, &remote) else {
+            return false;
+        };
+        if let Err(e) = crate::branches::append_file(&conflict.local_file, &appended.bytes) {
+            log::warn!("Could not append to the live session {session_id}: {e:#}");
+            return false;
+        }
+        self.written.insert(conflict.local_file.clone());
+        self.counts.fast_forwarded += 1;
+        conflict.resolution = reconciled("fast-forwarded a live session by appending");
+
+        let mut windows = 0;
+        if let Some((fork_leaf, remote_tip)) = appended.stale_span() {
+            let pids = crate::branches::live_pids_for(claude_home, session_id);
+            windows = pids.len();
+            let transcript = std::path::absolute(&conflict.local_file)
+                .unwrap_or_else(|_| conflict.local_file.clone());
+            if let Err(e) =
+                crate::stale::mark(session_id, &transcript, &pids, fork_leaf, remote_tip)
+            {
+                log::warn!("Could not mark {session_id} as out of date: {e:#}");
+            }
+        }
+        println!(
+            "  {} {} is open here: appended the other PC's turns ({} window(s) must /resume to see them)",
+            "↻".cyan(),
+            session_id,
+            windows
+        );
+        true
     }
 
     fn write(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -357,6 +416,12 @@ pub fn pull_history(
         println!("{}", "Pulling Claude Code history...".cyan().bold());
     }
 
+    // Windows that closed on an out-of-date chat leave their entries in the
+    // transcript; take them out before anything is compared.
+    if let Err(e) = crate::stale::sweep() {
+        log::warn!("Could not repair the chats of closed windows: {e:#}");
+    }
+
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
     let filter = FilterConfig::load()?;
@@ -404,7 +469,8 @@ pub fn pull_history(
     }
 
     // Sessions running here now: their transcripts are not rewritten.
-    let live_sessions = crate::branches::live_session_ids(&claude_home_dir()?);
+    let claude_home = claude_home_dir()?;
+    let live_sessions = crate::branches::live_session_ids(&claude_home);
 
     // Discover local sessions
     println!("  {} local sessions...", "Discovering".cyan());
@@ -737,8 +803,12 @@ pub fn pull_history(
                 .unwrap_or(&conflict.local_file)
                 .to_path_buf();
             // A running session is still being written: never rewrite it
-            // under Claude Code. Its turn comes on a later sync.
-            if branches.defer_if_live(&relative) {
+            // under Claude Code. A remote that only added is appended to it
+            // instead; anything else comes on a later sync.
+            if branches.is_live(&relative) {
+                if !branches.fast_forward_live(conflict, &relative, &claude_home) {
+                    branches.defer_if_live(&relative);
+                }
                 continue;
             }
             // The two transcripts this conflict is between, by their own paths:
