@@ -1,5 +1,7 @@
 //! Automatic sync: a timer that runs `autosync run` every few minutes, plus
-//! a Claude Code `SessionEnd` hook that runs it as soon as a chat closes.
+//! Claude Code hooks (see [`HOOKS`]): a sync as soon as a turn finishes or a
+//! chat closes, and the guard that stops a prompt typed in a window that holds
+//! an out-of-date chat (see `crate::stale`).
 //!
 //! - macOS: a LaunchAgent, loaded with `launchctl bootstrap gui/<uid>`.
 //! - Linux: a systemd user service and timer (a crontab line when systemd
@@ -30,19 +32,50 @@ pub const SYSTEMD_UNIT: &str = "claude-code-sync-autosync";
 /// The Task Scheduler task's name.
 pub const WINDOWS_TASK: &str = "claude-code-sync autosync";
 
-/// What the hook runs after the binary: a detached `autosync run`, so
-/// closing a chat is never held up by a sync. Also how our hook is told
-/// apart from everyone else's.
-pub const HOOK_ARGS: [&str; 3] = ["autosync", "run", "--detach"];
+/// A detached `autosync run`: what the Windows task's `.vbs` runs, and what
+/// the `SessionEnd` hook ran before 0.6.0 (still recognized, so `install`
+/// replaces it and `uninstall` removes it).
+pub const DETACH_ARGS: [&str; 3] = ["autosync", "run", "--detach"];
 
 /// The shell-form command line an earlier build of this fork wrote, still
 /// recognized so `install` replaces it and `uninstall` removes it.
 const LEGACY_HOOK_COMMAND_SUFFIX: &str = "autosync run --detach";
 
-/// Seconds Claude Code gives the hook. `SessionEnd` hooks share a 1.5 s
-/// budget unless one asks for more; the detached launch returns in
-/// milliseconds, and this only covers a slow disk.
-pub const HOOK_TIMEOUT_SECONDS: u64 = 10;
+/// A Claude Code hook this module installs: the event, the arguments after
+/// the binary (which also tell it apart from everyone else's hooks), and the
+/// seconds Claude Code gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookSpec {
+    pub event: &'static str,
+    pub args: [&'static str; 2],
+    pub timeout_seconds: u64,
+}
+
+/// The hooks `autosync install` adds. `SessionEnd` hooks share a 1.5 s
+/// budget unless one asks for more; each of these returns in milliseconds,
+/// and the timeouts only cover a slow disk.
+pub const HOOKS: [HookSpec; 4] = [
+    HookSpec {
+        event: "UserPromptSubmit",
+        args: ["hook", "prompt"],
+        timeout_seconds: 5,
+    },
+    HookSpec {
+        event: "SessionStart",
+        args: ["hook", "session-start"],
+        timeout_seconds: 5,
+    },
+    HookSpec {
+        event: "SessionEnd",
+        args: ["hook", "session-end"],
+        timeout_seconds: 10,
+    },
+    HookSpec {
+        event: "Stop",
+        args: ["hook", "stop"],
+        timeout_seconds: 5,
+    },
+];
 
 /// The retention `autosync install` asks Claude Code for: it otherwise
 /// deletes transcripts older than 30 days on its own, on one machine.
@@ -346,7 +379,8 @@ pub fn crontab_line(layout: &Layout, interval_minutes: u32) -> String {
 /// The `.vbs` the Windows task runs: the binary, with no window at all.
 pub fn windows_vbs(layout: &Layout) -> String {
     // A VBScript string doubles its quotes; the outer pair quotes the path.
-    let command = format!("\"{}\" {}", layout.exe_text(), HOOK_ARGS.join(" ")).replace('"', "\"\"");
+    let command =
+        format!("\"{}\" {}", layout.exe_text(), DETACH_ARGS.join(" ")).replace('"', "\"\"");
     format!(
         "' claude-code-sync autosync: one sync, with no console window.\r\n\
          ' Written by `claude-code-sync autosync install`, removed by `autosync uninstall`.\r\n\
@@ -387,16 +421,16 @@ pub fn schtasks_create(layout: &Layout, interval_minutes: u32) -> PlannedCommand
     )
 }
 
-/// The `SessionEnd` hook, in Claude Code's exec form (2.1.139 and later):
-/// the binary's absolute path and its arguments, run without a shell. The
-/// same entry works on every OS — no quoting for Git Bash, `cmd.exe` or
-/// PowerShell to get wrong, whatever the path holds.
-pub fn hook_entry(exe: &Path) -> Value {
+/// A hook, in Claude Code's exec form (2.1.139 and later): the binary's
+/// absolute path and its arguments, run without a shell. The same entry
+/// works on every OS — no quoting for Git Bash, `cmd.exe` or PowerShell to
+/// get wrong, whatever the path holds.
+pub fn hook_entry(exe: &Path, spec: &HookSpec) -> Value {
     serde_json::json!({
         "type": "command",
         "command": exe.to_string_lossy(),
-        "args": HOOK_ARGS,
-        "timeout": HOOK_TIMEOUT_SECONDS,
+        "args": spec.args,
+        "timeout": spec.timeout_seconds,
     })
 }
 
@@ -502,48 +536,87 @@ fn indent_continuation(pretty: &str) -> String {
     pretty.replace('\n', "\n  ")
 }
 
-/// Whether a hook entry is one autosync installed: the exec form, or the
-/// shell form an earlier build wrote.
-fn is_our_hook(hook: &Value) -> bool {
-    let exec_form = hook
-        .get("args")
-        .and_then(|args| args.as_array())
-        .is_some_and(|args| args.iter().map(|a| a.as_str()).eq(HOOK_ARGS.map(Some)));
-    let shell_form = hook
-        .get("command")
-        .and_then(|c| c.as_str())
-        .is_some_and(|c| c.trim_end().ends_with(LEGACY_HOOK_COMMAND_SUFFIX));
-    exec_form || shell_form
+/// Whether a command is this tool's binary: named `claude-code-sync` (with
+/// or without `.exe`, whatever its directory or version suffix), or the
+/// `exe` an install is placing. The new hooks' arguments (`hook prompt`)
+/// are short enough for another tool to use too.
+fn is_our_binary(command: &str, exe: Option<&Path>) -> bool {
+    if exe.is_some_and(|exe| Path::new(command) == exe) {
+        return true;
+    }
+    let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    name.to_ascii_lowercase().starts_with("claude-code-sync")
 }
 
-/// Remove autosync's hooks from a `hooks` object; returns whether any was.
-fn remove_our_hooks(hooks: &mut serde_json::Map<String, Value>) -> bool {
-    let Some(Value::Array(groups)) = hooks.get_mut("SessionEnd") else {
-        return false;
-    };
-    let mut removed = false;
-    groups.retain_mut(|group| {
-        let Some(Value::Array(entries)) = group.get_mut("hooks") else {
-            return true;
+/// Whether a hook entry under `event` is one autosync installed: the exec
+/// form of that event's hook, or — under `SessionEnd`, where 0.5.0 put it —
+/// the detached run, in exec form or the shell form an earlier build wrote.
+fn is_our_hook(event: &str, hook: &Value, exe: Option<&Path>) -> bool {
+    let args: Option<Vec<Option<&str>>> = hook
+        .get("args")
+        .and_then(|args| args.as_array())
+        .map(|args| args.iter().map(|a| a.as_str()).collect());
+    let ours = hook
+        .get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| is_our_binary(c, exe));
+    let exec_form = ours
+        && args.as_ref().is_some_and(|args| {
+            HOOKS
+                .iter()
+                .filter(|spec| spec.event == event)
+                .any(|spec| args.iter().copied().eq(spec.args.map(Some)))
+        });
+    let legacy = event == "SessionEnd"
+        && (args
+            .as_ref()
+            .is_some_and(|args| args.iter().copied().eq(DETACH_ARGS.map(Some)))
+            || hook
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.trim_end().ends_with(LEGACY_HOOK_COMMAND_SUFFIX)));
+    exec_form || legacy
+}
+
+/// Remove autosync's hooks from a `hooks` object; returns the events one
+/// was removed from.
+fn remove_our_hooks(
+    hooks: &mut serde_json::Map<String, Value>,
+    exe: Option<&Path>,
+) -> Vec<&'static str> {
+    let mut events = Vec::new();
+    for spec in &HOOKS {
+        let event = spec.event;
+        let Some(Value::Array(groups)) = hooks.get_mut(event) else {
+            continue;
         };
-        let before = entries.len();
-        entries.retain(|hook| !is_our_hook(hook));
-        if entries.len() == before {
-            return true;
+        let mut removed = false;
+        groups.retain_mut(|group| {
+            let Some(Value::Array(entries)) = group.get_mut("hooks") else {
+                return true;
+            };
+            let before = entries.len();
+            entries.retain(|hook| !is_our_hook(event, hook, exe));
+            if entries.len() == before {
+                return true;
+            }
+            removed = true;
+            !entries.is_empty()
+        });
+        if removed && groups.is_empty() {
+            hooks.remove(event);
         }
-        removed = true;
-        !entries.is_empty()
-    });
-    if removed && groups.is_empty() {
-        hooks.remove("SessionEnd");
+        if removed {
+            events.push(event);
+        }
     }
-    removed
+    events
 }
 
 /// `settings.json` after an install: the retention raised to
 /// [`RETENTION_DAYS`] when lower or missing, and — unless `hook` is `None`
-/// (`--no-hooks`) — exactly one `SessionEnd` hook of ours running the
-/// binary at `hook` (see [`hook_entry`]).
+/// (`--no-hooks`) — exactly one hook of ours per event of [`HOOKS`], running
+/// the binary at `hook` (see [`hook_entry`]).
 /// Every other member, and every other hook, is left as it was. `None` when
 /// nothing changes; otherwise the new text and what changed.
 pub fn settings_after_install(
@@ -575,16 +648,21 @@ pub fn settings_after_install(
         }
         None => serde_json::Map::new(),
     };
-    let removed = remove_our_hooks(&mut hooks);
+    let removed = remove_our_hooks(&mut hooks, hook);
     if let Some(exe) = hook {
-        let ours = serde_json::json!({ "hooks": [hook_entry(exe)] });
-        let groups = hooks
-            .entry("SessionEnd")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let Value::Array(groups) = groups else {
-            bail!("settings.json has a \"hooks.SessionEnd\" that is not a list; fix it first");
-        };
-        groups.push(ours);
+        for spec in &HOOKS {
+            let ours = serde_json::json!({ "hooks": [hook_entry(exe, spec)] });
+            let groups = hooks
+                .entry(spec.event)
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(groups) = groups else {
+                bail!(
+                    "settings.json has a \"hooks.{}\" that is not a list; fix it first",
+                    spec.event
+                );
+            };
+            groups.push(ours);
+        }
     }
     let hooks_changed = match &hooks_before {
         Some(before) => *before != Value::Object(hooks.clone()),
@@ -596,12 +674,28 @@ pub fn settings_after_install(
         } else {
             settings.set("hooks", &Value::Object(hooks));
         }
-        let runs = |exe: &Path| format!("{} {}", exe.display(), HOOK_ARGS.join(" "));
-        changes.push(match (hook, removed) {
-            (Some(exe), false) => format!("SessionEnd hook added: {}", runs(exe)),
-            (Some(exe), true) => format!("SessionEnd hook updated: {}", runs(exe)),
-            (None, _) => "SessionEnd hook removed (--no-hooks)".to_string(),
-        });
+        match hook {
+            Some(exe) => {
+                for spec in &HOOKS {
+                    changes.push(format!(
+                        "{} hook {}: {} {}",
+                        spec.event,
+                        if removed.contains(&spec.event) {
+                            "updated"
+                        } else {
+                            "added"
+                        },
+                        exe.display(),
+                        spec.args.join(" ")
+                    ));
+                }
+            }
+            None => {
+                for event in &removed {
+                    changes.push(format!("{event} hook removed (--no-hooks)"));
+                }
+            }
+        }
     }
 
     if changes.is_empty() {
@@ -610,7 +704,7 @@ pub fn settings_after_install(
     Ok(Some((settings.render(), changes)))
 }
 
-/// `settings.json` after an uninstall: autosync's hook removed, nothing
+/// `settings.json` after an uninstall: autosync's hooks removed, nothing
 /// else — the retention stays raised, since lowering it would let Claude
 /// Code delete transcripts. `None` when there is no hook of ours.
 pub fn settings_after_uninstall(original: Option<&str>) -> Result<Option<(String, Vec<String>)>> {
@@ -621,7 +715,8 @@ pub fn settings_after_uninstall(original: Option<&str>) -> Result<Option<(String
     let Some(Value::Object(mut hooks)) = settings.get("hooks") else {
         return Ok(None);
     };
-    if !remove_our_hooks(&mut hooks) {
+    let removed = remove_our_hooks(&mut hooks, None);
+    if removed.is_empty() {
         return Ok(None);
     }
     if hooks.is_empty() {
@@ -631,7 +726,10 @@ pub fn settings_after_uninstall(original: Option<&str>) -> Result<Option<(String
     }
     Ok(Some((
         settings.render(),
-        vec!["SessionEnd hook removed".to_string()],
+        removed
+            .iter()
+            .map(|event| format!("{event} hook removed"))
+            .collect(),
     )))
 }
 
@@ -921,8 +1019,10 @@ pub fn install(interval_minutes: u32, hooks: bool, dry_run: bool) -> Result<()> 
     }
     if hooks {
         println!(
-            "{} a closed Claude Code chat syncs right away (SessionEnd hook)",
-            "✓".green()
+            "{} every finished turn and every closed chat syncs right away; a chat left open \
+             on an out-of-date version is guarded (hooks: {})",
+            "✓".green(),
+            HOOKS.map(|spec| spec.event).join(", ")
         );
     }
     println!("  Log: {}", layout.log_path().display());
@@ -1023,26 +1123,29 @@ pub fn status() -> Result<()> {
 
     let settings: Option<Value> = read_settings(&layout)?
         .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok());
-    let hooked = settings
-        .as_ref()
-        .and_then(|s| s.pointer("/hooks/SessionEnd"))
-        .and_then(|groups| groups.as_array())
-        .is_some_and(|groups| {
-            groups.iter().any(|group| {
-                group
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| hooks.iter().any(is_our_hook))
-            })
-        });
-    println!(
-        "  SessionEnd hook: {}",
-        if hooked {
-            "installed".green()
-        } else {
-            "not installed".yellow()
-        }
-    );
+    for spec in &HOOKS {
+        let hooked = settings
+            .as_ref()
+            .and_then(|s| s.pointer(&format!("/hooks/{}", spec.event)))
+            .and_then(|groups| groups.as_array())
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|hooks| hooks.iter().any(|h| is_our_hook(spec.event, h, None)))
+                })
+            });
+        println!(
+            "  {} hook: {}",
+            spec.event,
+            if hooked {
+                "installed".green()
+            } else {
+                "not installed".yellow()
+            }
+        );
+    }
     let retention = settings
         .as_ref()
         .and_then(|s| s.get("cleanupPeriodDays"))
@@ -1379,21 +1482,31 @@ mod tests {
     }
 
     #[test]
-    fn the_hook_runs_the_binary_without_a_shell() {
+    fn the_hooks_run_the_binary_without_a_shell() {
         let exe =
             r"C:\Users\Mateo Bodenlle\AppData\Local\Programs\claude-code-sync\claude-code-sync.exe";
-        assert_eq!(
-            hook_entry(Path::new(exe)),
-            serde_json::json!({
-                "type": "command",
-                "command": exe,
-                "args": ["autosync", "run", "--detach"],
-                "timeout": 10,
-            })
-        );
+        let expected = [
+            ("UserPromptSubmit", ["hook", "prompt"], 5),
+            ("SessionStart", ["hook", "session-start"], 5),
+            ("SessionEnd", ["hook", "session-end"], 10),
+            ("Stop", ["hook", "stop"], 5),
+        ];
+        assert_eq!(HOOKS.len(), expected.len());
+        for (spec, (event, args, timeout)) in HOOKS.iter().zip(expected) {
+            assert_eq!(spec.event, event);
+            assert_eq!(
+                hook_entry(Path::new(exe), spec),
+                serde_json::json!({
+                    "type": "command",
+                    "command": exe,
+                    "args": args,
+                    "timeout": timeout,
+                })
+            );
+        }
         let unusual = "/home/o'neil/Iñaki $HOME/claude-code-sync";
         assert_eq!(
-            hook_entry(Path::new(unusual))["command"],
+            hook_entry(Path::new(unusual), &HOOKS[0])["command"],
             unusual,
             "the path as it is: nothing to quote without a shell"
         );
@@ -1434,10 +1547,10 @@ mod tests {
 }
 "#;
 
-    /// Each `SessionEnd` hook as one line: its command, then its arguments.
-    fn hook_commands(text: &str) -> Vec<String> {
+    /// Each hook of `event` as one line: its command, then its arguments.
+    fn hook_commands(text: &str, event: &str) -> Vec<String> {
         let value: Value = serde_json::from_str(text).unwrap();
-        value["hooks"]["SessionEnd"]
+        value["hooks"][event]
             .as_array()
             .map(|groups| {
                 groups
@@ -1456,8 +1569,13 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// `SessionEnd` hooks only.
+    fn session_end(text: &str) -> Vec<String> {
+        hook_commands(text, "SessionEnd")
+    }
+
     #[test]
-    fn the_install_adds_one_hook_beside_the_others_and_keeps_transcripts() {
+    fn the_install_adds_our_hooks_beside_the_others_and_keeps_transcripts() {
         let ours = Path::new("/x/claude-code-sync");
         let (text, changes) = settings_after_install(Some(EXISTING), Some(ours))
             .unwrap()
@@ -1466,15 +1584,27 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["cleanupPeriodDays"], 3650);
         assert_eq!(
-            hook_commands(&text),
-            vec!["say bye", "/x/claude-code-sync autosync run --detach"]
+            session_end(&text),
+            vec!["say bye", "/x/claude-code-sync hook session-end"]
         );
+        for (event, line) in [
+            ("UserPromptSubmit", "/x/claude-code-sync hook prompt"),
+            ("SessionStart", "/x/claude-code-sync hook session-start"),
+            ("Stop", "/x/claude-code-sync hook stop"),
+        ] {
+            assert_eq!(hook_commands(&text, event), vec![line], "{event}");
+        }
         let added = &value["hooks"]["SessionEnd"][1]["hooks"][0];
-        assert_eq!(added, &hook_entry(ours), "the exec form, no shell");
+        assert_eq!(
+            added,
+            &hook_entry(ours, &HOOKS[2]),
+            "the exec form, no shell"
+        );
         assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
         assert_eq!(value["model"], "opus");
-        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert_eq!(changes.len(), 5, "{changes:?}");
         assert!(changes[0].contains("cleanupPeriodDays 30 -> 3650"));
+        assert!(changes[1].starts_with("UserPromptSubmit hook added"));
 
         // Members keep their order and untouched ones their exact text.
         let order: Vec<usize> = [
@@ -1504,14 +1634,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            hook_commands(&moved_text),
-            vec!["say bye", "/y/claude-code-sync autosync run --detach"]
+            session_end(&moved_text),
+            vec!["say bye", "/y/claude-code-sync hook session-end"]
+        );
+        assert_eq!(
+            hook_commands(&moved_text, "Stop"),
+            vec!["/y/claude-code-sync hook stop"]
         );
 
         // Uninstall removes ours only and leaves the retention raised.
-        let (after, _) = settings_after_uninstall(Some(&text)).unwrap().unwrap();
+        let (after, changes) = settings_after_uninstall(Some(&text)).unwrap().unwrap();
         let value: Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(hook_commands(&after), vec!["say bye"]);
+        assert_eq!(changes.len(), 4, "{changes:?}");
+        assert_eq!(session_end(&after), vec!["say bye"]);
+        for event in ["UserPromptSubmit", "SessionStart", "Stop"] {
+            assert!(value["hooks"].get(event).is_none(), "{event} is gone");
+        }
         assert_eq!(value["cleanupPeriodDays"], 3650);
         assert_eq!(
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -1548,15 +1686,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(
-            hook_commands(&installed),
-            vec!["say bye", "/x/claude-code-sync autosync run --detach"]
+            session_end(&installed),
+            vec!["say bye", "/x/claude-code-sync hook session-end"],
+            "the old detached run is replaced, not kept beside the new hook"
         );
-        assert!(changes[0].contains("updated"), "{changes:?}");
+        let session_end_change = changes
+            .iter()
+            .find(|c| c.starts_with("SessionEnd"))
+            .expect("a SessionEnd change");
+        assert!(session_end_change.contains("updated"), "{changes:?}");
 
         let (uninstalled, _) = settings_after_uninstall(Some(legacy)).unwrap().unwrap();
-        assert_eq!(hook_commands(&uninstalled), vec!["say bye"]);
+        assert_eq!(session_end(&uninstalled), vec!["say bye"]);
         let (both_gone, _) = settings_after_uninstall(Some(&installed)).unwrap().unwrap();
-        assert_eq!(hook_commands(&both_gone), vec!["say bye"]);
+        assert_eq!(session_end(&both_gone), vec!["say bye"]);
     }
 
     #[test]
@@ -1568,19 +1711,22 @@ mod tests {
         assert_eq!(text, "{\n  \"cleanupPeriodDays\": 3650\n}");
         assert_eq!(changes.len(), 1, "{changes:?}");
 
-        let (fresh, _) = settings_after_install(None, Some(Path::new("/x")))
+        let (fresh, _) = settings_after_install(None, Some(Path::new("/x/claude-code-sync")))
             .unwrap()
             .unwrap();
         let value: Value = serde_json::from_str(&fresh).unwrap();
         assert_eq!(value["cleanupPeriodDays"], 3650);
-        assert_eq!(hook_commands(&fresh), vec!["/x autosync run --detach"]);
+        assert_eq!(
+            session_end(&fresh),
+            vec!["/x/claude-code-sync hook session-end"]
+        );
     }
 
     #[test]
     fn a_byte_order_mark_is_dropped_and_no_hooks_removes_ours() {
         let with_ours = settings_after_install(
             Some("\u{feff}{\"cleanupPeriodDays\": 3650}"),
-            Some(Path::new("/x")),
+            Some(Path::new("/x/claude-code-sync")),
         )
         .unwrap()
         .unwrap()
@@ -1589,7 +1735,10 @@ mod tests {
         let (without, changes) = settings_after_install(Some(&with_ours), None)
             .unwrap()
             .unwrap();
-        assert!(hook_commands(&without).is_empty());
+        for event in ["UserPromptSubmit", "SessionStart", "SessionEnd", "Stop"] {
+            assert!(hook_commands(&without, event).is_empty(), "{event}");
+        }
+        assert_eq!(changes.len(), 4, "{changes:?}");
         assert!(changes[0].contains("removed"));
         assert!(!without.contains("\"hooks\""), "{without}");
     }
@@ -1597,6 +1746,82 @@ mod tests {
     #[test]
     fn a_settings_file_that_is_not_an_object_is_refused() {
         assert!(settings_after_install(Some("[1]"), None).is_err());
-        assert!(settings_after_install(Some("{\"hooks\": 3}"), Some(Path::new("/x"))).is_err());
+        assert!(settings_after_install(
+            Some("{\"hooks\": 3}"),
+            Some(Path::new("/x/claude-code-sync"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_exec_form_of_0_5_0_is_replaced_and_other_tools_hooks_are_not_touched() {
+        let before = r#"{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/old/claude-code-sync",
+            "args": ["autosync", "run", "--detach"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/bin/other-tool", "args": ["hook", "prompt"] },
+          { "type": "command", "command": "notify-send done" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/bin/other-tool", "args": ["hook", "prompt"] }
+        ]
+      }
+    ]
+  },
+  "cleanupPeriodDays": 3650
+}
+"#;
+        let (text, _) =
+            settings_after_install(Some(before), Some(Path::new("/new/claude-code-sync")))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            session_end(&text),
+            vec!["/new/claude-code-sync hook session-end"]
+        );
+        assert_eq!(
+            hook_commands(&text, "Stop"),
+            vec![
+                "/usr/bin/other-tool hook prompt",
+                "notify-send done",
+                "/new/claude-code-sync hook stop"
+            ],
+            "another tool's `hook prompt` under Stop is not ours"
+        );
+        assert_eq!(
+            hook_commands(&text, "UserPromptSubmit"),
+            vec![
+                "/usr/bin/other-tool hook prompt",
+                "/new/claude-code-sync hook prompt"
+            ],
+            "ours goes beside theirs, whatever its arguments"
+        );
+        let (after, _) = settings_after_uninstall(Some(&text)).unwrap().unwrap();
+        assert!(session_end(&after).is_empty());
+        assert_eq!(
+            hook_commands(&after, "Stop"),
+            vec!["/usr/bin/other-tool hook prompt", "notify-send done"]
+        );
+        assert_eq!(
+            hook_commands(&after, "UserPromptSubmit"),
+            vec!["/usr/bin/other-tool hook prompt"]
+        );
     }
 }

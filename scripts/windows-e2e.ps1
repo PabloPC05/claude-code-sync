@@ -340,11 +340,14 @@ function Read-SettingsJson {
     $parsed
 }
 
-function Get-SessionEndCommands {
-    param([System.Collections.IDictionary]$Settings)
+function Get-HookCommands {
+    param(
+        [System.Collections.IDictionary]$Settings,
+        [string]$HookEvent = 'SessionEnd'
+    )
     $commands = [System.Collections.Generic.List[string]]::new()
-    if ($Settings.Contains('hooks') -and $Settings['hooks'].Contains('SessionEnd')) {
-        foreach ($group in @($Settings['hooks']['SessionEnd'])) {
+    if ($Settings.Contains('hooks') -and $Settings['hooks'].Contains($HookEvent)) {
+        foreach ($group in @($Settings['hooks'][$HookEvent])) {
             foreach ($hook in @($group['hooks'])) {
                 # Exec form (`args` set) runs `command` directly with those
                 # arguments; shell form keeps everything in `command`.
@@ -359,10 +362,18 @@ function Get-SessionEndCommands {
     , $commands.ToArray()
 }
 
+# What each hook runs after the binary (autosync.rs: HOOKS).
+$script:OurHooks = [ordered]@{
+    UserPromptSubmit = 'hook prompt'
+    SessionStart     = 'hook session-start'
+    SessionEnd       = 'hook session-end'
+    Stop             = 'hook stop'
+}
+
 function Test-OurHook {
-    param([string]$Command)
+    param([string]$Command, [string]$Arguments = 'hook session-end')
     $normalized = $Command -replace '\\', '/'
-    $normalized.EndsWith('autosync run --detach', [StringComparison]::Ordinal) -and
+    $normalized.EndsWith($Arguments, [StringComparison]::Ordinal) -and
     $normalized.IndexOf(($script:ExeFull -replace '\\', '/'), [StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
@@ -591,10 +602,16 @@ try {
     $settings = Read-SettingsJson $settingsPath
     Assert-True ([int64]$settings['cleanupPeriodDays'] -ge 3650) 'settings.json: cleanupPeriodDays >= 3650 (was 30)' "got $($settings['cleanupPeriodDays'])"
     Assert-Equal 'opus' $settings['model'] 'settings.json: unrelated members are kept'
-    $commands = Get-SessionEndCommands $settings
+    $commands = Get-HookCommands $settings 'SessionEnd'
     Assert-True ($commands -contains 'echo keep-me') 'settings.json: the existing SessionEnd hook is kept'
-    $ours = @($commands | Where-Object { Test-OurHook $_ })
-    Assert-Equal 1 $ours.Count "settings.json: exactly one SessionEnd hook points at the exe ($($ours -join ''))"
+    foreach ($hookEvent in $script:OurHooks.Keys) {
+        $arguments = $script:OurHooks[$hookEvent]
+        $eventCommands = Get-HookCommands $settings $hookEvent
+        $ours = @($eventCommands | Where-Object { Test-OurHook $_ $arguments })
+        Assert-Equal 1 $ours.Count "settings.json: exactly one $hookEvent hook runs ""<exe> $arguments"" ($($ours -join ''))"
+    }
+    $oldForm = @($commands | Where-Object { $_.EndsWith('autosync run --detach', [StringComparison]::Ordinal) })
+    Assert-Equal 0 $oldForm.Count 'settings.json: no SessionEnd hook runs the old "autosync run --detach"'
 
     $vbsPath = Join-Path $A.Config 'claude-code-sync\autosync.vbs'
     Assert-True (Test-Path -LiteralPath $vbsPath -PathType Leaf) 'the hidden .vbs wrapper was written'
@@ -623,7 +640,9 @@ try {
 
     $status = Invoke-Ccs -Pc $A -CliArgs @('autosync', 'status')
     Assert-True ($status.Output -match 'Task Scheduler task "claude-code-sync autosync" \(present\)') 'autosync status: task present'
-    Assert-True ($status.Output -match 'SessionEnd hook: installed') 'autosync status: hook installed'
+    foreach ($hookEvent in $script:OurHooks.Keys) {
+        Assert-True ($status.Output -match "$hookEvent hook: installed") "autosync status: $hookEvent hook installed"
+    }
     Assert-True ($status.Output -match 'retention: 3650 days') 'autosync status: retention 3650 days'
 
     # A new local change on A, then run the task right away.
@@ -666,9 +685,12 @@ try {
     Assert-True (-not (Test-TaskExists)) 'autosync uninstall: the scheduled task is gone'
     Assert-True (-not (Test-Path -LiteralPath $vbsPath)) 'autosync uninstall: the .vbs wrapper is removed'
     $after = Read-SettingsJson $settingsPath
-    $afterCommands = Get-SessionEndCommands $after
-    $oursAfter = @($afterCommands | Where-Object { Test-OurHook $_ })
-    Assert-Equal 0 $oursAfter.Count 'autosync uninstall: our SessionEnd hook is removed'
+    $afterCommands = Get-HookCommands $after 'SessionEnd'
+    foreach ($hookEvent in $script:OurHooks.Keys) {
+        $arguments = $script:OurHooks[$hookEvent]
+        $oursAfter = @(Get-HookCommands $after $hookEvent | Where-Object { Test-OurHook $_ $arguments })
+        Assert-Equal 0 $oursAfter.Count "autosync uninstall: our $hookEvent hook is removed"
+    }
     Assert-True ($afterCommands -contains 'echo keep-me') 'autosync uninstall: the other hook stays'
     Assert-True ([int64]$after['cleanupPeriodDays'] -ge 3650) 'autosync uninstall: cleanupPeriodDays stays >= 3650' "got $($after['cleanupPeriodDays'])"
     Assert-Equal 'opus' $after['model'] 'autosync uninstall: unrelated members still kept'
