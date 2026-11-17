@@ -1168,26 +1168,62 @@ pub fn status() -> Result<()> {
 
 /// `autosync run`: one non-interactive sync, unless another run holds the
 /// lock. With `detach`, start that in the background and return at once.
+///
+/// A run that finds the lock taken leaves the flag `sync.rerun` and goes:
+/// the holder, once its sync is done, syncs again (at most
+/// [`crate::sync_lock::MAX_EXTRA_ROUNDS`] more times), so a turn that
+/// finished during a sync is pushed without waiting for the timer.
 pub fn run(detach: bool) -> Result<()> {
     if detach {
         return spawn_detached();
     }
-    std::env::set_var(crate::interactive_conflict::NONINTERACTIVE_ENV, "1");
-
-    let Some(_lock) = crate::sync_lock::SyncLock::try_acquire()? else {
-        log::info!("autosync: another sync is running; leaving it to that one");
-        return Ok(());
+    let lock = match crate::sync_lock::SyncLock::try_acquire()? {
+        Some(lock) => lock,
+        None => {
+            crate::sync_lock::request_rerun()?;
+            // The holder may have finished between the two calls: then its
+            // last look at the flag is past, and this run does the sync.
+            match crate::sync_lock::SyncLock::try_acquire()? {
+                Some(lock) => lock,
+                None => {
+                    log::info!("autosync: another sync is running; it will sync again when done");
+                    return Ok(());
+                }
+            }
+        }
     };
     if !crate::handlers::is_initialized()? {
         log::info!("autosync: not initialized (run `claude-code-sync init`); nothing to do");
         return Ok(());
     }
 
-    println!(
-        "--- autosync {} ---",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    crate::sync::sync_bidirectional(None, None, false, false, crate::VerbosityLevel::Quiet)
+    std::env::set_var(crate::interactive_conflict::NONINTERACTIVE_ENV, "1");
+
+    // Whoever asked before this run took the lock is served by it.
+    crate::sync_lock::take_rerun()?;
+    let rounds = sync_with_reruns(|| {
+        println!(
+            "--- autosync {} ---",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        crate::sync::sync_bidirectional(None, None, false, false, crate::VerbosityLevel::Quiet)
+    })?;
+    log::debug!("autosync: {rounds} round(s)");
+    drop(lock);
+    Ok(())
+}
+
+/// Run `sync`, then again for as long as another run asked for it while it
+/// ran, up to [`crate::sync_lock::MAX_EXTRA_ROUNDS`] more. Returns the
+/// number of rounds run. Held under the sync lock.
+fn sync_with_reruns(mut sync: impl FnMut() -> Result<()>) -> Result<u32> {
+    let mut rounds = 1;
+    sync()?;
+    while rounds <= crate::sync_lock::MAX_EXTRA_ROUNDS && crate::sync_lock::take_rerun()? {
+        rounds += 1;
+        sync()?;
+    }
+    Ok(rounds)
 }
 
 /// Start `autosync run` in its own process group, output appended to the
@@ -1823,5 +1859,80 @@ mod tests {
             hook_commands(&after, "UserPromptSubmit"),
             vec!["/usr/bin/other-tool hook prompt"]
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_sync_is_repeated_for_a_request_made_while_it_ran_up_to_three_times() {
+        let config = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var("CLAUDE_CODE_SYNC_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", config.path());
+
+        // No request: one round.
+        let mut calls = 0;
+        assert_eq!(
+            sync_with_reruns(|| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+
+        // One request during the first round: two rounds.
+        let mut calls = 0;
+        let rounds = sync_with_reruns(|| {
+            calls += 1;
+            if calls == 1 {
+                crate::sync_lock::request_rerun()?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((rounds, calls), (2, 2));
+
+        // A request during every round: the first and three more, no more.
+        let mut calls = 0;
+        let rounds = sync_with_reruns(|| {
+            calls += 1;
+            crate::sync_lock::request_rerun()?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((rounds, calls), (4, 4));
+        assert!(
+            crate::sync_lock::take_rerun().unwrap(),
+            "the last request waits for the timer"
+        );
+
+        // A failed sync stops at once.
+        assert!(sync_with_reruns(|| anyhow::bail!("boom")).is_err());
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_run_that_finds_the_lock_taken_leaves_the_flag_and_goes() {
+        let config = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var("CLAUDE_CODE_SYNC_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", config.path());
+
+        let holder = crate::sync_lock::SyncLock::try_acquire().unwrap().unwrap();
+        run(false).unwrap();
+        assert!(
+            crate::sync_lock::take_rerun().unwrap(),
+            "the run asked the holder for another round"
+        );
+        drop(holder);
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR"),
+        }
     }
 }

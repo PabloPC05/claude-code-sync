@@ -18,6 +18,33 @@ pub struct SyncLock {
     _file: File,
 }
 
+/// The flag file: `sync.rerun` in the config directory. A run that finds the
+/// lock taken leaves it; the holder syncs once more when it finishes, so a
+/// turn that ended during a sync is still pushed promptly.
+pub fn rerun_flag_path() -> Result<PathBuf> {
+    Ok(crate::config::ConfigManager::ensure_config_dir()?.join("sync.rerun"))
+}
+
+/// How many extra rounds the lock holder runs for the flag, at most.
+pub const MAX_EXTRA_ROUNDS: u32 = 3;
+
+/// Ask the lock holder for another sync after its current one.
+pub fn request_rerun() -> Result<()> {
+    let path = rerun_flag_path()?;
+    std::fs::write(&path, b"")
+        .with_context(|| format!("Failed to write the flag {}", path.display()))
+}
+
+/// Take the request: whether there was one (and it is now cleared).
+pub fn take_rerun() -> Result<bool> {
+    let path = rerun_flag_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Failed to remove the flag {}", path.display())),
+    }
+}
+
 /// The lock file: `sync.lock` in the config directory.
 pub fn lock_path() -> Result<PathBuf> {
     Ok(crate::config::ConfigManager::ensure_config_dir()?.join("sync.lock"))
@@ -91,6 +118,26 @@ mod tests {
             SyncLock::try_acquire().unwrap().is_some(),
             "released on drop"
         );
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn the_rerun_flag_is_taken_once() {
+        let config = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var("CLAUDE_CODE_SYNC_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", config.path());
+
+        assert!(!take_rerun().unwrap(), "nothing asked yet");
+        request_rerun().unwrap();
+        request_rerun().unwrap();
+        assert!(rerun_flag_path().unwrap().is_file());
+        assert!(take_rerun().unwrap(), "asked, however many times");
+        assert!(!take_rerun().unwrap(), "and cleared");
 
         match previous {
             Some(v) => std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", v),
