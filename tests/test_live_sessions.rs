@@ -429,9 +429,12 @@ fn the_guard_blocks_the_stale_window_until_it_resumes() {
     let ancestors = stale::claude_ancestors();
     assert_eq!(ancestors, vec![s.window.id()]);
     let reason = hooks::prompt_verdict(&hook_input(), &ancestors).expect("blocked");
-    let json: serde_json::Value = serde_json::from_str(&hooks::block_json(reason)).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&hooks::block_json(&reason)).unwrap();
     assert_eq!(json["decision"], "block");
-    assert!(json["reason"].as_str().unwrap().contains("/resume"));
+    assert!(json["reason"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("/resume {SESSION}")));
 
     // Another window, or another chat, is not.
     assert_eq!(hooks::prompt_verdict(&hook_input(), &[1]), None);

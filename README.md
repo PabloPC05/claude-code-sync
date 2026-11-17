@@ -191,8 +191,9 @@ it on PC B, and A's window is out of date. Since 0.6.0:
 - **A stale window is guarded.** The pull records which windows (Claude Code
   process ids) hold the old version in `<config dir>/stale/<session>.json`. The
   `UserPromptSubmit` hook blocks a prompt typed in such a window and says so:
-  type `/resume`, pick the same chat (the first in the list) to load the latest,
-  then send the message again. The `SessionStart` hook (it also fires for
+  type `/resume <id>` (the message gives the exact command; the picker never
+  lists the chat open in the window it runs in) to load the latest, then send
+  the message again. The `SessionStart` hook (it also fires for
   `/resume` inside a running window) clears the mark.
 - **Closing a stale window is repaired.** `/exit` appends three entries to the
   transcript hanging off the window's old leaf, which makes Claude Code resume

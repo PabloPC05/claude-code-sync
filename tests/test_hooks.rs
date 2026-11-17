@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
-use claude_code_sync::hooks::BLOCK_REASON;
+use claude_code_sync::hooks::block_reason;
 use claude_code_sync::stale;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -169,8 +169,8 @@ fn the_prompt_hook_blocks_only_a_window_that_is_behind() {
     );
     let json: serde_json::Value = serde_json::from_str(stdout(&blocked).trim()).unwrap();
     assert_eq!(json["decision"], "block");
-    assert_eq!(json["reason"], BLOCK_REASON);
-    assert!(BLOCK_REASON.contains("/resume"));
+    assert_eq!(json["reason"], block_reason(SESSION));
+    assert!(block_reason(SESSION).contains(&format!("/resume {SESSION}")));
 
     // Another window, another chat, and bad input all pass, silently.
     for (input, pid) in [

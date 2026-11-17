@@ -22,8 +22,13 @@ pub enum Event {
     Whoami,
 }
 
-/// What a blocked prompt shows the person.
-pub const BLOCK_REASON: &str = "Este chat ha seguido en tu otro PC y esta ventana tiene la versión de antes, así que no he enviado tu mensaje. Escribe /resume y elige este mismo chat (el primero de la lista) para cargar lo último; después vuelve a enviarlo.";
+/// What a blocked prompt shows the person. `/resume` with the chat's id is
+/// the way: the picker never lists the chat open in the window it runs in.
+pub fn block_reason(session_id: &str) -> String {
+    format!(
+        "Este chat ha seguido en tu otro PC y esta ventana tiene la versión de antes, así que no he enviado tu mensaje. Para cargar lo último escribe /resume {session_id} y luego vuelve a enviarlo."
+    )
+}
 
 /// Run a hook. Never fails and never panics outward.
 pub fn run(event: Event) {
@@ -47,7 +52,7 @@ fn handle(event: Event) -> anyhow::Result<()> {
                 .read_to_string(&mut input)
                 .ok();
             if let Some(reason) = prompt_verdict(&input, &crate::stale::claude_ancestors()) {
-                println!("{}", block_json(reason));
+                println!("{}", block_json(&reason));
             }
         }
         Event::SessionStart => {
@@ -84,13 +89,13 @@ fn handle(event: Event) -> anyhow::Result<()> {
 
 /// `Some(reason)` when the prompt typed in the window above `ancestors`
 /// must be blocked: the hook's input names a chat that window is behind on.
-pub fn prompt_verdict(input: &str, ancestors: &[u32]) -> Option<&'static str> {
+pub fn prompt_verdict(input: &str, ancestors: &[u32]) -> Option<String> {
     let session_id = serde_json::from_str::<serde_json::Value>(input)
         .ok()?
         .get("session_id")?
         .as_str()?
         .to_string();
-    crate::stale::stale_for(&session_id, ancestors).map(|_| BLOCK_REASON)
+    crate::stale::stale_for(&session_id, ancestors).map(|_| block_reason(&session_id))
 }
 
 /// The JSON a `UserPromptSubmit` hook prints to stop the prompt.
