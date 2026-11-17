@@ -116,6 +116,11 @@ fn default_max_file_size() -> u64 {
     10 * 1024 * 1024 // 10MB
 }
 
+/// The size limit a config written by `init` or onboarding starts with:
+/// 95 MiB, just under the 100 MB GitHub refuses a file over. A long session
+/// passes 10 MB easily, and a transcript left out does not sync at all.
+pub const NEW_CONFIG_MAX_FILE_SIZE_BYTES: u64 = 95 * 1024 * 1024;
+
 fn default_scm_backend() -> String {
     "git".to_string()
 }
@@ -155,6 +160,16 @@ impl Default for FilterConfig {
 }
 
 impl FilterConfig {
+    /// The configuration a new setup saves: the defaults, with the size
+    /// limit at [`NEW_CONFIG_MAX_FILE_SIZE_BYTES`]. A config without the key
+    /// still reads as 10 MB, as it always has.
+    pub fn for_new_config() -> Self {
+        FilterConfig {
+            max_file_size_bytes: NEW_CONFIG_MAX_FILE_SIZE_BYTES,
+            ..Default::default()
+        }
+    }
+
     /// Load configuration from file
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
@@ -940,6 +955,18 @@ mod tests {
         let older_config: FilterConfig = toml::from_str("max_file_size_bytes = 1024").unwrap();
 
         assert!(!older_config.warn_each_skipped_file);
+    }
+
+    #[test]
+    fn a_new_config_allows_transcripts_up_to_95_mib() {
+        let fresh = FilterConfig::for_new_config();
+        assert_eq!(fresh.max_file_size_bytes, 95 * 1024 * 1024);
+        assert!(
+            fresh.max_file_size_bytes < 100_000_000,
+            "under GitHub's limit"
+        );
+        let reloaded: FilterConfig = toml::from_str(&toml::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(reloaded.max_file_size_bytes, fresh.max_file_size_bytes);
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub fn init_sync_repo(repo_path: &Path, remote_url: Option<&str>) -> Result<()> 
     // Save default filter configuration if it doesn't exist
     let filter_config_path = crate::config::ConfigManager::filter_config_path()?;
     if !filter_config_path.exists() {
-        crate::filter::FilterConfig::default().save()?;
+        crate::filter::FilterConfig::for_new_config().save()?;
     }
 
     println!(

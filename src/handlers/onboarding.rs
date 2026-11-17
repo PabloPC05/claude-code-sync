@@ -51,7 +51,7 @@ pub fn run_onboarding_flow() -> Result<()> {
         exclude_attachments: onboarding_config.exclude_attachments,
         exclude_older_than_days: onboarding_config.exclude_older_than_days,
         sync_artifacts: onboarding_config.sync_artifacts.clone(),
-        ..Default::default()
+        ..filter::FilterConfig::for_new_config()
     };
     filter_config
         .save()
@@ -111,7 +111,7 @@ pub fn run_init_from_config<P: AsRef<Path>>(config_path: Option<P>) -> Result<()
         scm_backend: init_config.scm_backend.clone(),
         sync_subdirectory: init_config.sync_subdirectory.clone(),
         sync_artifacts: init_config.sync_artifacts.clone(),
-        ..Default::default()
+        ..filter::FilterConfig::for_new_config()
     };
     filter_config
         .save()

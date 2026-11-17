@@ -604,7 +604,7 @@ fn main() -> Result<()> {
                 // Save default filter configuration if it doesn't exist
                 let filter_config_path = config::ConfigManager::filter_config_path()?;
                 if !filter_config_path.exists() {
-                    filter::FilterConfig::default().save()?;
+                    filter::FilterConfig::for_new_config().save()?;
                 }
 
                 println!("{}", "Clone and initialization complete!".green().bold());
@@ -631,7 +631,7 @@ fn main() -> Result<()> {
                 // Save default filter configuration if it doesn't exist
                 let filter_config_path = config::ConfigManager::filter_config_path()?;
                 if !filter_config_path.exists() {
-                    filter::FilterConfig::default().save()?;
+                    filter::FilterConfig::for_new_config().save()?;
                 }
 
                 println!("{}", "Clone and initialization complete!".green().bold());

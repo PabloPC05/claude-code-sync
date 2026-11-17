@@ -99,17 +99,21 @@ fn warn_oversized(path: &Path, max_file_size_bytes: u64) {
 
     let size_mb = size as f64 / (1024.0 * 1024.0);
     let limit_mb = max_file_size_bytes as f64 / (1024.0 * 1024.0);
-    println!(
-        "  {} Skipping {} ({:.1} MB, over the {:.1} MB max_file_size_bytes limit)",
-        "⚠️ ".yellow().bold(),
+    let warning = format!(
+        "Skipping {} ({:.1} MB, over the {:.1} MB max_file_size_bytes limit): it does not sync",
         path.display(),
         size_mb,
         limit_mb
     );
+    println!("  {} {warning}", "⚠️ ".yellow().bold());
     println!(
         "     {}",
-        "Raise it with `claude-code-sync config` to sync this conversation".dimmed()
+        "Raise it with `claude-code-sync config` to sync this conversation \
+         (GitHub refuses files over 100 MB)"
+            .dimmed()
     );
+    // Also in the log file: an unattended run's output may go nowhere.
+    let _ = crate::logger::log_to_file(&format!("WARN {warning}"));
 }
 
 /// Check for large conversation files and emit warnings
