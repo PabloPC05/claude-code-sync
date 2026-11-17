@@ -60,6 +60,25 @@ struct TranscriptCounts {
     kept_local: usize,
     combined: usize,
     branched: usize,
+    /// Both sides added messages: whatever settled it (a parallel branch,
+    /// a smart merge, an answer to `-i`), a real conflict.
+    diverged: usize,
+    /// Left as it was: its pre-pull backup could not be taken.
+    unresolved: usize,
+}
+
+impl TranscriptCounts {
+    /// What the transcripts that differed add to the summary's Modified,
+    /// Conflicts and Unchanged columns. Only a divergence (or one left
+    /// unresolved) is a conflict: a fast-forward or a metadata merge is a
+    /// modification, and a copy already holding everything is unchanged.
+    fn summary_columns(&self) -> (usize, usize, usize) {
+        (
+            self.fast_forwarded + self.combined,
+            self.diverged + self.unresolved,
+            self.kept_local,
+        )
+    }
 }
 
 /// Writes what reconciling transcripts decides, and remembers it: which
@@ -709,6 +728,7 @@ pub fn pull_history(
                     "Leaving conflict {} unresolved (no pre-pull backup could be taken)",
                     conflict.session_id
                 );
+                branches.counts.unresolved += 1;
                 continue;
             }
             let relative = conflict
@@ -759,6 +779,7 @@ pub fn pull_history(
                     branch_id,
                     branch,
                 } => {
+                    branches.counts.diverged += 1;
                     let Some(session_id) = resumable.as_deref() else {
                         // A subagent transcript is not resumed on its own:
                         // it keeps the smart merge.
@@ -1326,7 +1347,10 @@ pub fn pull_history(
     println!("\n{}", "=== Pull Summary ===".bold().cyan());
 
     // Show operation statistics
-    let conflict_count = detector.conflict_count();
+    let (reconciled_modified, conflict_count, reconciled_unchanged) =
+        branches.counts.summary_columns();
+    let modified_count = modified_count + reconciled_modified;
+    let unchanged_count = unchanged_count + reconciled_unchanged;
     let stats_msg = format!(
         "  {} Added    {} Modified    {} Conflicts    {} Unchanged",
         format!("{added_count}").green(),
@@ -1557,5 +1581,23 @@ mod tests {
         assert!(branch_text.contains("desde A") && !branch_text.contains("desde B"));
         assert!(!branch_text.contains(SESSION));
         assert!(!machine.has_unfinished_merge(), "the merge is committed");
+    }
+
+    #[test]
+    fn only_a_divergence_counts_as_a_conflict_in_the_summary() {
+        let counts = TranscriptCounts {
+            fast_forwarded: 3,
+            kept_local: 2,
+            combined: 1,
+            branched: 1,
+            diverged: 2,
+            unresolved: 1,
+        };
+        assert_eq!(
+            counts.summary_columns(),
+            (4, 3, 2),
+            "fast-forwarded and combined are modified, kept local unchanged"
+        );
+        assert_eq!(TranscriptCounts::default().summary_columns(), (0, 0, 0));
     }
 }
