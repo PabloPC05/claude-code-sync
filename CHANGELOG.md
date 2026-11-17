@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0 (fork: Syncthing mode)
+
+For two PCs whose `~/.claude/projects` is carried by Syncthing instead of git.
+Git mode is unchanged.
+
+### Features
+
+* **guard:** `claude-code-sync guard install|uninstall|status|sweep|hook`: a Syncthing mode that needs no git, no sync repository and no `init`. `install` adds exec-form hooks for `UserPromptSubmit` (`guard hook prompt`), `SessionStart` (`start`), `Stop` (`stop`) and `SessionEnd` (`end`), sets `cleanupPeriodDays` to 3650 (Claude Code's 30-day cleanup would propagate deletions through Syncthing), leaves other hooks alone and refuses while the 0.6.0 autosync hooks are installed; `autosync install` refuses while the guard's hooks are installed
+* **guard:** each window keeps a record in `<config dir>/guard/windows/<pid>.json`: its transcript's file identity (device and inode; volume serial and file index on Windows), its leaf and the uuids it loaded. Syncthing replaces a file by renaming a temporary one over it, which changes the identity; Claude's own appends do not
+* **guard:** the prompt hook blocks a prompt typed in a window whose file was replaced and holds messages it never loaded, naming the exact `/resume <id>`; a window's own appends (an Esc-interrupted turn included) and replacements that only add metadata never block; nothing changed means no parsing
+* **guard:** when a window that was behind closes, what it appended off its old leaf is removed (`/exit`'s entries, which made `claude --continue` show the old branch) or, if real messages, moved to a `(rama paralela)` session; under another live window on the same PC only the `/exit` entries go
+* **guard:** `*.sync-conflict-*` copies are settled by every hook and by `guard sweep`: session transcripts are reconciled like a pull does (take over, combine, or split into a parallel session; a chat open in a window is only appended to, and that window is then behind), other `.jsonl` files become the union of both, `history.jsonl` the union ordered by `timestamp`; other copies are left alone, and the result is the same on both PCs
+
 ## 0.6.0 (fork: open windows, stale-window guard, per-turn push)
 
 A chat left open on one PC while the other continues it no longer waits for the

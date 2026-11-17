@@ -24,6 +24,7 @@ cargo doc --open --no-deps --all-features
 |---------|-------------|
 | **Parallel Branches** | A chat continued on two machines becomes two sessions Claude Code can resume, instead of one file that hides a branch |
 | **Root Map** | Map a projects folder once per machine; every project under it, new ones included, syncs across OSes and user names |
+| **Syncthing mode (`guard`)** | When Syncthing, not git, carries the transcripts: hooks block a prompt typed in a window that is behind, repair what it appends when it closes, and settle `*.sync-conflict-*` copies |
 | **Autosync** | A timer plus a Claude Code `SessionEnd` hook sync on their own, without prompts, one run at a time |
 | **Artifact Sync** | Carry settings, skills, agents, commands, rules, hooks, plugin manifests, plans, todos, and prompt history across machines |
 | **Project Map** | Pin a project to its path per machine, so renamed or relocated checkouts stay one project |
@@ -69,7 +70,7 @@ Claude Code stores conversation history locally in `~/.claude/projects/` as JSON
 6. Fast-forwards a session only one machine continued, and splits one both
    continued into two sessions (see [Parallel branches](#parallel-branches-a-chat-continued-on-both-machines))
 
-## Fork additions: root map, parallel branches, autosync
+## Fork additions: root map, parallel branches, autosync, Syncthing mode
 
 This fork is for one person who works on two or more machines — possibly on
 different operating systems, with different user names and home paths — keeps
@@ -269,6 +270,87 @@ hook fire together, the second run leaves quietly. A `sync`, `pull`, `push` or
 If you also sync the `settings` artifact category, the hook's absolute binary
 path travels with `settings.json`; run `autosync install` again on each machine
 after a pull that changed it.
+
+### Syncthing mode (`guard`)
+
+Git is not the only way to move `~/.claude` between two PCs. If Syncthing
+carries it, `claude-code-sync guard` keeps a chat from being damaged on the
+way. It needs no git, no sync repository and no `init`, and it is an
+alternative to autosync: install one or the other, not both (each refuses
+while the other's hooks are in `settings.json`). Git mode is unchanged.
+
+**What to share.** Add `~/.claude` as a Syncthing folder on both PCs, with a
+`.stignore` that shares only the chats and the prompt history:
+
+```
+!/projects
+!/history.jsonl
+*
+```
+
+The project paths must be identical on both PCs (the same absolute path for
+the same project), because Claude Code names a project's folder after its
+path; the two sides then use the same folder names and nothing has to be
+mapped. Keep the Claude Code versions on both PCs recent and alike.
+
+**What goes wrong without the guard.** Claude Code loads a chat once and keeps
+it in memory. Leave a window open on PC A, continue the same chat on PC B, and
+Syncthing brings B's turns into A's file (it writes a temporary file and
+renames it over the original). Back in A's old window:
+
+- typing a message makes Claude answer from its stale memory and append a
+  branch off its old leaf, which then hides B's turns;
+- closing it with `/exit` appends three entries off that old leaf, and
+  `claude --continue` shows the old branch;
+- if both PCs changed a chat while apart, Syncthing keeps one copy and renames
+  the other to `<name>.sync-conflict-<date>-<time>-<device>.jsonl`, which
+  Claude Code never shows.
+
+**What the guard does.**
+
+```bash
+claude-code-sync guard install [--dry-run]   # on each PC
+claude-code-sync guard status
+claude-code-sync guard sweep                 # settle every conflict copy now
+claude-code-sync guard uninstall
+```
+
+`install` adds four exec-form hooks to Claude Code's `settings.json`
+(`UserPromptSubmit`, `SessionStart`, `Stop`, `SessionEnd`, each running
+`claude-code-sync guard hook <prompt|start|stop|end>`), leaves other hooks
+alone, and sets `cleanupPeriodDays` to 3650: Claude Code's default deletes
+transcripts after 30 days, and Syncthing would carry those deletions to the
+other PC. Hooks do no network or git work, always exit 0 and say nothing
+unless they block a prompt.
+
+- Each window gets a record in `<config dir>/guard/windows/<pid>.json`: the
+  identity of its transcript file (device and inode, or volume serial and file
+  index on Windows), its leaf and the uuids it has loaded. Claude's own
+  appends never change a file's identity; Syncthing's replacement always does.
+- **Prompt.** If the file was replaced and now holds user or assistant messages
+  the window never loaded, the prompt is blocked and the typed text kept, with
+  the exact command to run: `/resume <id>`. That reloads the chat and
+  `SessionStart` records it again. A replacement that only added metadata (a
+  title, a `last-prompt`) does not block, and neither does a turn the window
+  wrote itself, interrupted with Esc or not.
+- **Close.** When a window that was behind closes, what it appended off its old
+  leaf is taken out: the `/exit` entries are removed, so `claude --continue`
+  shows the latest turns again, and real messages it wrote become a
+  `(rama paralela)` session, the same repair git mode makes. While another
+  window on the same PC holds the chat only the `/exit` entries go.
+- **Conflict copies.** Every hook settles the `*.sync-conflict-*` copies of its
+  project, and `SessionStart` also settles `history.jsonl`'s. A chat copy is
+  reconciled like a git-mode pull does (the main file as local, the copy as
+  remote): a copy that only adds takes over, one that adds messages on both
+  sides becomes a parallel session. A chat open in a window here is only
+  appended to (that window is then behind and gets the same prompt block), and
+  a copy that is not a plain continuation waits for the window to close.
+  Other `.jsonl` files (subagents) become the union of both, the history the
+  union of both ordered by `timestamp`, and copies of other files stay as they
+  are. The result depends only on the two files, so both PCs converge.
+
+`guard status` lists the hooks, the retention, the number of recorded windows
+and the conflict copies still waiting.
 
 ### Other changes in this fork
 
@@ -1114,6 +1196,20 @@ claude-code-sync autosync install --interval-minutes 10 --dry-run   # show what 
 claude-code-sync autosync install                                   # do it
 claude-code-sync autosync status
 claude-code-sync autosync uninstall
+```
+
+### `guard`
+
+Syncthing mode: protect chats when Syncthing, not git, carries the
+transcripts; see [Syncthing mode](#syncthing-mode-guard). None of these needs
+git or `init`.
+
+```bash
+claude-code-sync guard install --dry-run   # show the settings.json changes
+claude-code-sync guard install
+claude-code-sync guard status
+claude-code-sync guard sweep               # settle the conflict copies now
+claude-code-sync guard uninstall
 ```
 
 ### `self-update`
