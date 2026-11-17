@@ -1942,4 +1942,22 @@ mod tests {
             None => std::env::remove_var("CLAUDE_CODE_SYNC_CONFIG_DIR"),
         }
     }
+    #[test]
+    fn installing_autosync_hooks_refuses_while_the_guard_is_installed() {
+        let guard_settings = crate::guard::settings_after_install(
+            None,
+            std::path::Path::new("/opt/ccs/claude-code-sync"),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let linux = layout(Platform::Linux);
+        let error = install_plan(&linux, 10, true, Some(&guard_settings)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("guard uninstall"),
+            "{error:#}"
+        );
+        // Without the hooks the timer alone does not clash.
+        assert!(install_plan(&linux, 10, false, Some(&guard_settings)).is_ok());
+    }
 }

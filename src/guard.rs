@@ -1490,9 +1490,11 @@ fn settings_path() -> Result<PathBuf> {
 
 fn read_settings(path: &Path) -> Result<Option<String>> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(
-            String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", path.display()))?,
-        )),
+        Ok(bytes) => {
+            Ok(Some(String::from_utf8(bytes).with_context(|| {
+                format!("{} is not UTF-8", path.display())
+            })?))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
     }
@@ -1642,4 +1644,873 @@ pub fn sweep() -> Result<()> {
         println!("No conflict copies to settle");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::process::{Child, Command, Stdio};
+
+    const S: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// Config and Claude directories in a temp dir, and the environment
+    /// pointing at them.
+    struct Env {
+        _tmp: tempfile::TempDir,
+        claude: PathBuf,
+        project: PathBuf,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Env {
+        fn new() -> Env {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let claude = tmp.path().join("claude");
+            let project = claude.join("projects").join("-p");
+            std::fs::create_dir_all(&project).unwrap();
+            let names = ["CLAUDE_CODE_SYNC_CONFIG_DIR", "CLAUDE_CODE_SYNC_CLAUDE_DIR"];
+            let saved = names
+                .into_iter()
+                .map(|n| (n, std::env::var(n).ok()))
+                .collect();
+            std::env::set_var("CLAUDE_CODE_SYNC_CONFIG_DIR", tmp.path().join("cfg"));
+            std::env::set_var("CLAUDE_CODE_SYNC_CLAUDE_DIR", &claude);
+            Env {
+                _tmp: tmp,
+                claude,
+                project,
+                saved,
+            }
+        }
+
+        fn transcript(&self) -> PathBuf {
+            self.project.join(format!("{S}.jsonl"))
+        }
+
+        /// Say that `pid` is a window on `session`.
+        fn open_window(&self, pid: u32, session: &str) {
+            let dir = self.claude.join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{pid}.json")),
+                format!("{{\"pid\":{pid},\"sessionId\":\"{session}\"}}"),
+            )
+            .unwrap();
+        }
+
+        fn jsonl_files(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.project)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".jsonl"))
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn long_child() -> Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn kill(mut child: Child) {
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    fn entry_at(uuid: &str, parent: Option<&str>, kind: &str, text: &str, time: &str) -> String {
+        let parent = parent.map_or("null".to_string(), |p| format!("\"{p}\""));
+        let content = if kind == "user" {
+            format!("\"{text}\"")
+        } else {
+            format!("[{{\"type\":\"text\",\"text\":\"{text}\"}}]")
+        };
+        format!(
+            "{{\"parentUuid\":{parent},\"type\":\"{kind}\",\"message\":{{\"role\":\"{kind}\",\
+             \"content\":{content}}},\"uuid\":\"{uuid}\",\"timestamp\":\"{time}\",\
+             \"sessionId\":\"{S}\"}}\n"
+        )
+    }
+
+    fn entry(uuid: &str, parent: Option<&str>, kind: &str, text: &str) -> String {
+        entry_at(uuid, parent, kind, text, "2026-01-01T10:00:00.000Z")
+    }
+
+    /// What `/exit` appends off the window's leaf.
+    fn exit_noise(parent: &str) -> String {
+        format!(
+            "{{\"parentUuid\":\"{parent}\",\"isMeta\":true,\"type\":\"user\",\"message\":\
+             {{\"role\":\"user\",\"content\":\"<local-command-caveat>x</local-command-caveat>\"}},\
+             \"uuid\":\"n1\",\"sessionId\":\"{S}\"}}\n"
+        ) + &entry(
+            "n2",
+            Some("n1"),
+            "user",
+            "<command-name>/exit</command-name>",
+        ) + &entry(
+            "n3",
+            Some("n2"),
+            "user",
+            "<local-command-stdout>Bye!</local-command-stdout>",
+        )
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    /// What Syncthing does to a file it brings in.
+    fn replace(path: &Path, text: &str) {
+        branches::write_file(path, text.as_bytes()).unwrap();
+    }
+
+    fn p1_p2() -> String {
+        entry("p1", None, "user", "hola") + &entry("p2", Some("p1"), "assistant", "buenas")
+    }
+
+    fn r1_r2() -> String {
+        entry("r1", Some("p2"), "user", "sigue") + &entry("r2", Some("r1"), "assistant", "claro")
+    }
+
+    fn last_message_uuid(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| {
+                v.get("type")
+                    .is_some_and(|t| t == "user" || t == "assistant")
+            })
+            .filter_map(|v| v.get("uuid")?.as_str().map(str::to_string))
+            .next_back()
+            .unwrap()
+    }
+
+    // ---- identity -------------------------------------------------------
+
+    #[test]
+    fn an_append_keeps_the_identity_and_a_rename_replace_changes_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let before = file_identity(&path).expect("an identity on this platform");
+        append(&path, "b\n");
+        assert!(before.same_file(&file_identity(&path).unwrap()));
+        replace(&path, "a\nb\nc\n");
+        assert!(!before.same_file(&file_identity(&path).unwrap()));
+        assert!(file_identity(&tmp.path().join("missing")).is_none());
+    }
+
+    // ---- verdict --------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn the_windows_own_appends_never_block() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None, "recorded now");
+        // A turn interrupted with Esc: real messages, no Stop in between.
+        append(&env.transcript(), &r1_r2());
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        let record = load(10).unwrap();
+        assert_eq!(record.leaf.as_deref(), Some("r2"), "the record follows");
+        assert!(record.known.contains("r1"));
+    }
+
+    #[test]
+    #[serial]
+    fn a_replaced_file_with_new_messages_blocks_with_the_resume_command() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        let before = load(10).unwrap();
+
+        replace(&env.transcript(), &(p1_p2() + &r1_r2()));
+        let reason = verdict(10, S, &env.transcript()).expect("blocked");
+        assert!(reason.contains(&format!("/resume {S}")), "{reason}");
+        assert_eq!(load(10).unwrap(), before, "the record is left alone");
+        assert!(
+            verdict(10, S, &env.transcript()).is_some(),
+            "still blocked until the window reloads"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_replaced_file_with_metadata_only_does_not_block() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        let before = load(10).unwrap();
+
+        let meta = format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"x\",\"sessionId\":\"{S}\"}}\n\
+             {{\"type\":\"last-prompt\",\"leafUuid\":\"p2\",\"sessionId\":\"{S}\"}}\n\
+             {{\"type\":\"system\",\"uuid\":\"sys1\",\"parentUuid\":\"p2\"}}\n"
+        );
+        replace(&env.transcript(), &(p1_p2() + &meta));
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        let after = load(10).unwrap();
+        assert!(!after.identity.unwrap().same_file(&before.identity.unwrap()));
+        assert!(after.known.contains("sys1"), "the record was refreshed");
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+    }
+
+    #[test]
+    #[serial]
+    fn start_records_again_and_the_block_lifts() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        verdict(10, S, &env.transcript());
+        replace(&env.transcript(), &(p1_p2() + &r1_r2()));
+        assert!(verdict(10, S, &env.transcript()).is_some());
+
+        record(10, S, &env.transcript()).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        assert_eq!(load(10).unwrap().leaf.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    #[serial]
+    fn a_record_of_another_chat_is_replaced_and_a_late_file_adopted() {
+        let env = Env::new();
+        let other = env.project.join("other.jsonl");
+        std::fs::write(&other, p1_p2()).unwrap();
+        record(10, "other", &other).unwrap();
+        // The window moved to this chat (/resume): recorded now.
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        assert_eq!(load(10).unwrap().session_id, S);
+
+        // A chat with no file yet when the window started.
+        std::fs::remove_file(env.transcript()).unwrap();
+        record(11, S, &env.transcript()).unwrap();
+        assert_eq!(load(11).unwrap().identity, None);
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(11, S, &env.transcript()), None);
+        assert!(load(11).unwrap().identity.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn a_turn_that_ends_behind_does_not_hide_it_but_start_does() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        verdict(10, S, &env.transcript());
+        replace(&env.transcript(), &(p1_p2() + &r1_r2()));
+        // Stop runs the same follow-the-file logic as the prompt hook.
+        let _ = verdict(10, S, &env.transcript());
+        assert!(verdict(10, S, &env.transcript()).is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn an_unchanged_file_is_not_parsed_again() {
+        let env = Env::new();
+        // 10 MB: 20000 entries of 500 bytes.
+        let filler = "x".repeat(400);
+        let mut text = String::new();
+        let mut parent: Option<String> = None;
+        for i in 0..20_000 {
+            let uuid = format!("u{i}");
+            text.push_str(&entry(&uuid, parent.as_deref(), "assistant", &filler));
+            parent = Some(uuid);
+        }
+        std::fs::write(env.transcript(), &text).unwrap();
+        assert_eq!(verdict(10, S, &env.transcript()), None);
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(verdict(10, S, &env.transcript()), None);
+        }
+        let each = started.elapsed() / 20;
+        assert!(
+            each < std::time::Duration::from_millis(100),
+            "an unchanged 10 MB transcript took {each:?} per verdict"
+        );
+        // The record stays small: 16 hex digits an entry, not the uuids.
+        let size = std::fs::metadata(record_path(10).unwrap()).unwrap().len();
+        assert!(size < 20_000 * 17 + 1024, "{size}");
+    }
+
+    #[test]
+    fn known_round_trips_as_one_hex_string() {
+        let mut known = Known::default();
+        known.extend(&scan(entry("a", None, "user", "x").as_bytes()).entries);
+        known.extend(&scan(entry("b", Some("a"), "assistant", "y").as_bytes()).entries);
+        let json = serde_json::to_string(&known).unwrap();
+        assert_eq!(json.len(), 2 + 32);
+        let back: Known = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, known);
+        assert!(back.contains("a") && back.contains("b") && !back.contains("c"));
+        assert!(serde_json::from_str::<Known>("\"abc\"").is_err());
+    }
+
+    // ---- ended ----------------------------------------------------------
+
+    /// Window 10 loaded p1-p2; the other PC continued to r2 (replacing the
+    /// file); then the window's `extra` hangs off its own leaf p2.
+    fn window_behind(env: &Env, extra: &str) {
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        record(10, S, &env.transcript()).unwrap();
+        replace(&env.transcript(), &(p1_p2() + &r1_r2()));
+        append(&env.transcript(), extra);
+    }
+
+    #[test]
+    #[serial]
+    fn exit_noise_after_a_replace_is_removed_and_no_session_is_made() {
+        let env = Env::new();
+        window_behind(
+            &env,
+            &(exit_noise("p2")
+                + &format!(
+                    "{{\"type\":\"last-prompt\",\"leafUuid\":\"p2\",\"sessionId\":\"{S}\"}}\n"
+                )),
+        );
+        assert_eq!(last_message_uuid(&env.transcript()), "n3", "the bug");
+
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::Cleaned);
+        assert_eq!(last_message_uuid(&env.transcript()), "r2");
+        assert_eq!(env.jsonl_files(), vec![format!("{S}.jsonl")]);
+        assert!(load(10).is_none(), "the record is deleted");
+    }
+
+    #[test]
+    #[serial]
+    fn real_stale_messages_become_a_parallel_session() {
+        let env = Env::new();
+        window_behind(
+            &env,
+            &(entry("s1", Some("p2"), "user", "mi duda")
+                + &entry("s2", Some("s1"), "assistant", "tu respuesta")),
+        );
+
+        let outcome = ended(10, S, &env.transcript()).unwrap();
+        let Ended::Branched(branch_id) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            last_message_uuid(&env.transcript()),
+            "r2",
+            "the other PC's turns stay"
+        );
+        let main = std::fs::read_to_string(env.transcript()).unwrap();
+        assert!(!main.contains("\"s1\""));
+        assert_eq!(env.jsonl_files().len(), 2);
+        let branch =
+            std::fs::read_to_string(env.project.join(format!("{branch_id}.jsonl"))).unwrap();
+        assert!(branch.contains("(rama paralela)"), "{branch}");
+        assert!(branch.contains("mi duda") && branch.contains("tu respuesta"));
+        assert!(!branch.contains("\"r1\""), "only the window's own branch");
+        assert!(branch.contains(&branch_id));
+    }
+
+    #[test]
+    #[serial]
+    fn a_window_that_only_appended_leaves_the_transcript_alone() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        record(10, S, &env.transcript()).unwrap();
+        append(&env.transcript(), &exit_noise("p2"));
+        let before = std::fs::read(env.transcript()).unwrap();
+
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::Untouched);
+        assert_eq!(std::fs::read(env.transcript()).unwrap(), before);
+        assert!(load(10).is_none());
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::NoRecord);
+    }
+
+    #[test]
+    #[serial]
+    fn a_replace_with_metadata_only_leaves_the_transcript_alone() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        record(10, S, &env.transcript()).unwrap();
+        replace(
+            &env.transcript(),
+            &(p1_p2()
+                + &format!("{{\"type\":\"mode\",\"sessionId\":\"{S}\"}}\n")
+                + &exit_noise("p2")),
+        );
+        let before = std::fs::read(env.transcript()).unwrap();
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::Untouched);
+        assert_eq!(std::fs::read(env.transcript()).unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn another_live_window_only_loses_noise_never_a_split() {
+        let env = Env::new();
+        let other = long_child();
+        env.open_window(other.id(), S);
+
+        window_behind(&env, &exit_noise("p2"));
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::Cleaned);
+        assert_eq!(last_message_uuid(&env.transcript()), "r2");
+
+        window_behind(
+            &env,
+            &(entry("s1", Some("p2"), "user", "mi duda")
+                + &entry("s2", Some("s1"), "assistant", "ok")),
+        );
+        let before = std::fs::read(env.transcript()).unwrap();
+        assert_eq!(ended(10, S, &env.transcript()).unwrap(), Ended::Deferred);
+        assert_eq!(std::fs::read(env.transcript()).unwrap(), before);
+        assert_eq!(env.jsonl_files().len(), 1, "no branch under a live window");
+        kill(other);
+    }
+
+    #[test]
+    #[serial]
+    fn the_other_pcs_turns_win_even_when_the_window_appended_after_them() {
+        let env = Env::new();
+        window_behind(
+            &env,
+            &(entry("s1", Some("p2"), "user", "tarde")
+                + &entry("s2", Some("s1"), "assistant", "tarde")
+                + &exit_noise("s2")),
+        );
+        // The newest unseen message in file order is the window's own.
+        let scanned = scan(&std::fs::read(env.transcript()).unwrap());
+        let fresh = unseen(&scanned.entries, &load(10).unwrap().known);
+        assert_eq!(fresh.last().unwrap().uuid, "s2");
+        assert_eq!(remote_tip(&scanned.entries, &fresh).as_deref(), Some("r2"));
+    }
+
+    // ---- conflict names -------------------------------------------------
+
+    #[test]
+    fn conflict_names_say_what_they_copy() {
+        let original = |n: &str| conflict_original(n);
+        assert_eq!(
+            original("abc.sync-conflict-20260101-101010-ABCDEFG.jsonl").as_deref(),
+            Some("abc.jsonl")
+        );
+        assert_eq!(
+            original("history.sync-conflict-20260101-101010-ABCDEFG.jsonl").as_deref(),
+            Some("history.jsonl")
+        );
+        assert_eq!(
+            original("a.b.sync-conflict-20260101-101010.md").as_deref(),
+            Some("a.b.md"),
+            "older Syncthing: no device id"
+        );
+        assert_eq!(
+            original("noext.sync-conflict-20260101-101010-ABCDEFG").as_deref(),
+            Some("noext")
+        );
+        assert_eq!(original("abc.jsonl"), None);
+        assert_eq!(original("abc.sync-conflict-2026.jsonl"), None);
+        assert_eq!(original("abc.sync-conflict-20260101-101010-AB.jsonl"), None);
+    }
+
+    // ---- sweep ----------------------------------------------------------
+
+    fn conflict_of(env: &Env, session: &str) -> PathBuf {
+        env.project.join(format!(
+            "{session}.sync-conflict-20260102-120000-ABCDEFG.jsonl"
+        ))
+    }
+
+    #[test]
+    #[serial]
+    fn a_conflict_copy_that_only_adds_takes_over() {
+        let env = Env::new();
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        std::fs::write(conflict_of(&env, S), p1_p2() + &r1_r2()).unwrap();
+
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(env.transcript()).unwrap(),
+            p1_p2() + &r1_r2()
+        );
+        assert!(!conflict_of(&env, S).exists());
+        // Swept from the projects folder as well.
+        std::fs::write(conflict_of(&env, S), p1_p2()).unwrap();
+        assert_eq!(
+            sweep_conflicts(&env.claude.join("projects"))
+                .unwrap()
+                .resolved
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_diverged_conflict_copy_splits_into_a_parallel_session() {
+        let env = Env::new();
+        // Local continued later than the copy: the copy's branch is older.
+        let local = p1_p2()
+            + &entry_at(
+                "a1",
+                Some("p2"),
+                "user",
+                "local",
+                "2026-01-03T10:00:00.000Z",
+            );
+        let remote = p1_p2()
+            + &entry_at(
+                "b1",
+                Some("p2"),
+                "user",
+                "remoto",
+                "2026-01-02T10:00:00.000Z",
+            );
+        std::fs::write(env.transcript(), &local).unwrap();
+        std::fs::write(conflict_of(&env, S), &remote).unwrap();
+
+        sweep_conflicts(&env.project).unwrap();
+        assert!(!conflict_of(&env, S).exists());
+        let files = env.jsonl_files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        // The older branch (the copy's) keeps the session.
+        assert_eq!(std::fs::read_to_string(env.transcript()).unwrap(), remote);
+        let branch = files.iter().find(|f| **f != format!("{S}.jsonl")).unwrap();
+        let branch = std::fs::read_to_string(env.project.join(branch)).unwrap();
+        assert!(
+            branch.contains("(rama paralela)") && branch.contains("local"),
+            "{branch}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_diverged_copy_with_the_newer_branch_keeps_the_main_file() {
+        let env = Env::new();
+        let local = p1_p2()
+            + &entry_at(
+                "a1",
+                Some("p2"),
+                "user",
+                "local",
+                "2026-01-02T10:00:00.000Z",
+            );
+        let remote = p1_p2()
+            + &entry_at(
+                "b1",
+                Some("p2"),
+                "user",
+                "remoto",
+                "2026-01-03T10:00:00.000Z",
+            );
+        std::fs::write(env.transcript(), &local).unwrap();
+        std::fs::write(conflict_of(&env, S), &remote).unwrap();
+        sweep_conflicts(&env.project).unwrap();
+        assert_eq!(std::fs::read_to_string(env.transcript()).unwrap(), local);
+        assert_eq!(env.jsonl_files().len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn a_live_chat_is_only_appended_to_and_its_window_is_behind() {
+        let env = Env::new();
+        let window = long_child();
+        env.open_window(window.id(), S);
+        std::fs::write(env.transcript(), p1_p2()).unwrap();
+        assert_eq!(verdict(window.id(), S, &env.transcript()), None);
+        let inode = file_identity(&env.transcript()).unwrap();
+        std::fs::write(conflict_of(&env, S), p1_p2() + &r1_r2()).unwrap();
+
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(env.transcript()).unwrap(),
+            p1_p2() + &r1_r2()
+        );
+        assert!(
+            inode.same_file(&file_identity(&env.transcript()).unwrap()),
+            "appended, not replaced"
+        );
+        let reason = verdict(window.id(), S, &env.transcript()).expect("the window is behind");
+        assert!(reason.contains(&format!("/resume {S}")));
+        // Closing it takes the noise off.
+        append(&env.transcript(), &exit_noise("p2"));
+        assert_eq!(
+            ended(window.id(), S, &env.transcript()).unwrap(),
+            Ended::Cleaned
+        );
+        assert_eq!(last_message_uuid(&env.transcript()), "r2");
+        kill(window);
+    }
+
+    #[test]
+    #[serial]
+    fn a_live_chat_whose_copy_is_not_a_plain_continuation_waits() {
+        let env = Env::new();
+        let window = long_child();
+        env.open_window(window.id(), S);
+        let local = p1_p2() + &entry("a1", Some("p2"), "user", "local");
+        let remote = p1_p2() + &entry("b1", Some("p2"), "user", "remoto");
+        std::fs::write(env.transcript(), &local).unwrap();
+        std::fs::write(conflict_of(&env, S), &remote).unwrap();
+
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.deferred, vec![conflict_of(&env, S)]);
+        assert!(conflict_of(&env, S).exists());
+        assert_eq!(std::fs::read_to_string(env.transcript()).unwrap(), local);
+
+        // Once the window is gone the next sweep settles it.
+        kill(window);
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(env.jsonl_files().len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn a_live_chat_whose_copy_adds_nothing_loses_the_copy() {
+        let env = Env::new();
+        let window = long_child();
+        env.open_window(window.id(), S);
+        std::fs::write(env.transcript(), p1_p2() + &r1_r2()).unwrap();
+        std::fs::write(conflict_of(&env, S), p1_p2()).unwrap();
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(env.transcript()).unwrap(),
+            p1_p2() + &r1_r2()
+        );
+        kill(window);
+    }
+
+    #[test]
+    #[serial]
+    fn history_copies_are_united_in_timestamp_order() {
+        let env = Env::new();
+        let history = env.claude.join("history.jsonl");
+        std::fs::write(
+            &history,
+            "{\"timestamp\":30,\"display\":\"c\"}\n{\"timestamp\":10,\"display\":\"a\"}\nsin fecha\n",
+        )
+        .unwrap();
+        std::fs::write(
+            env.claude
+                .join("history.sync-conflict-20260102-120000-ABCDEFG.jsonl"),
+            "{\"timestamp\":20,\"display\":\"b\"}\n{\"timestamp\":10,\"display\":\"a\"}\notra sin fecha\n",
+        )
+        .unwrap();
+
+        let report = sweep_history().unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&history).unwrap(),
+            "{\"timestamp\":10,\"display\":\"a\"}\n{\"timestamp\":20,\"display\":\"b\"}\n\
+             {\"timestamp\":30,\"display\":\"c\"}\nsin fecha\notra sin fecha\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&env.claude).unwrap().count(),
+            2,
+            "history.jsonl and projects"
+        );
+    }
+
+    #[test]
+    fn the_history_union_is_the_same_whichever_pc_computes_it() {
+        let a = b"{\"timestamp\":2,\"d\":\"x\"}\n{\"timestamp\":1,\"d\":\"y\"}\n";
+        let b = b"{\"timestamp\":2,\"d\":\"z\"}\n{\"timestamp\":3,\"d\":\"w\"}\n";
+        // Both PCs hold the same pair: the winner as the file, the loser as
+        // the copy, so the inputs are the same on both.
+        assert_eq!(union_history(a, b), union_history(a, b));
+        assert_eq!(
+            String::from_utf8(union_history(a, b)).unwrap(),
+            "{\"timestamp\":1,\"d\":\"y\"}\n{\"timestamp\":2,\"d\":\"x\"}\n\
+             {\"timestamp\":2,\"d\":\"z\"}\n{\"timestamp\":3,\"d\":\"w\"}\n"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_copies_are_united_line_by_line() {
+        let env = Env::new();
+        let dir = env.project.join(S).join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-1.jsonl"), "uno\ndos\n").unwrap();
+        std::fs::write(
+            dir.join("agent-1.sync-conflict-20260102-120000-ABCDEFG.jsonl"),
+            "dos\ntres\nuno\ncuatro",
+        )
+        .unwrap();
+
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report.resolved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("agent-1.jsonl")).unwrap(),
+            "uno\ndos\ntres\ncuatro\n"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(env.jsonl_files().len(), 0, "no session was made");
+    }
+
+    #[test]
+    #[serial]
+    fn copies_of_other_files_are_left_alone() {
+        let env = Env::new();
+        let memory = env.project.join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("MEMORY.md"), "a").unwrap();
+        let copy = memory.join("MEMORY.sync-conflict-20260102-120000-ABCDEFG.md");
+        std::fs::write(&copy, "b").unwrap();
+        let stray = env
+            .project
+            .join("x.sync-conflict-20260102-120000-ABCDEFG.txt");
+        std::fs::write(&stray, "c").unwrap();
+
+        let report = sweep_conflicts(&env.project).unwrap();
+        assert_eq!(report, SweepReport::default());
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), "b");
+        assert!(stray.exists());
+        assert_eq!(pending_conflicts().unwrap().len(), 2);
+    }
+
+    // ---- settings.json --------------------------------------------------
+
+    fn exe() -> PathBuf {
+        PathBuf::from("/opt/ccs/claude-code-sync")
+    }
+
+    #[test]
+    fn install_adds_the_hooks_and_the_retention_and_keeps_the_rest() {
+        let original = r#"{
+  "model": "opus",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/usr/bin/other", "args": ["hook", "prompt"] } ] }
+    ],
+    "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "x" } ] } ]
+  }
+}
+"#;
+        let (text, changes) = settings_after_install(Some(original), &exe())
+            .unwrap()
+            .unwrap();
+        let settings: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(settings["cleanupPeriodDays"], 3650);
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "x"
+        );
+        assert_eq!(
+            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "/usr/bin/other",
+            "a foreign hook is left alone"
+        );
+        let prompt = &settings["hooks"]["UserPromptSubmit"][1]["hooks"][0];
+        assert_eq!(
+            prompt,
+            &serde_json::json!({
+                "type": "command", "command": "/opt/ccs/claude-code-sync",
+                "args": ["guard", "hook", "prompt"], "timeout": 5
+            })
+        );
+        for (event, arg, timeout) in [
+            ("SessionStart", "start", 10),
+            ("Stop", "stop", 10),
+            ("SessionEnd", "end", 10),
+        ] {
+            let hook = &settings["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["args"], serde_json::json!(["guard", "hook", arg]));
+            assert_eq!(hook["timeout"], timeout);
+        }
+        assert!(changes.iter().any(|c| c.contains("cleanupPeriodDays")));
+        assert!(has_guard_hooks(Some(&text)));
+        assert!(!has_guard_hooks(Some(original)));
+
+        // Idempotent.
+        assert!(settings_after_install(Some(&text), &exe())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn install_keeps_a_higher_retention() {
+        let (text, changes) = settings_after_install(Some("{\"cleanupPeriodDays\": 9999}"), &exe())
+            .unwrap()
+            .unwrap();
+        let settings: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(settings["cleanupPeriodDays"], 9999);
+        assert!(!changes.iter().any(|c| c.contains("cleanupPeriodDays")));
+        let (text, _) = settings_after_install(Some("{\"cleanupPeriodDays\": 30}"), &exe())
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("3650"));
+    }
+
+    #[test]
+    fn install_refuses_while_autosync_hooks_are_installed() {
+        let autosync = r#"{ "hooks": { "SessionEnd": [ { "hooks": [
+            { "type": "command", "command": "/opt/ccs/claude-code-sync", "args": ["hook", "session-end"], "timeout": 10 } ] } ] } }"#;
+        let error = settings_after_install(Some(autosync), &exe()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("autosync uninstall"), "{message}");
+
+        let legacy = r#"{ "hooks": { "SessionEnd": [ { "hooks": [
+            { "type": "command", "command": "/opt/ccs/claude-code-sync autosync run --detach" } ] } ] } }"#;
+        assert!(settings_after_install(Some(legacy), &exe()).is_err());
+        let exec_legacy = r#"{ "hooks": { "SessionEnd": [ { "hooks": [
+            { "type": "command", "command": "/opt/ccs/claude-code-sync", "args": ["autosync", "run", "--detach"] } ] } ] } }"#;
+        assert!(settings_after_install(Some(exec_legacy), &exe()).is_err());
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_guards_hooks() {
+        let original = r#"{ "cleanupPeriodDays": 30, "hooks": { "Stop": [
+            { "hooks": [ { "type": "command", "command": "/usr/bin/mine" } ] } ] } }"#;
+        let (installed, _) = settings_after_install(Some(original), &exe())
+            .unwrap()
+            .unwrap();
+        let (text, changes) = settings_after_uninstall(Some(&installed)).unwrap().unwrap();
+        let settings: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(settings["cleanupPeriodDays"], 3650, "the retention stays");
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/usr/bin/mine"
+        );
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(settings["hooks"].get("SessionStart").is_none());
+        assert_eq!(changes.len(), 4);
+        assert!(settings_after_uninstall(Some(&text)).unwrap().is_none());
+        assert!(settings_after_uninstall(None).unwrap().is_none());
+
+        let (bare, _) = settings_after_install(None, &exe()).unwrap().unwrap();
+        let (emptied, _) = settings_after_uninstall(Some(&bare)).unwrap().unwrap();
+        let settings: Value = serde_json::from_str(&emptied).unwrap();
+        assert!(settings.get("hooks").is_none(), "{emptied}");
+    }
 }
