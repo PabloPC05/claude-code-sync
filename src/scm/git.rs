@@ -54,6 +54,13 @@ impl GitScm {
             .args(["config", "user.email", "claude-code-sync@local"])
             .current_dir(path)
             .output();
+        // Session ids, escaped project names and tool-result files easily pass
+        // Windows' 260-character limit, which Git for Windows enforces unless
+        // core.longpaths is on. Other platforms ignore the setting.
+        let _ = Command::new("git")
+            .args(["config", "core.longpaths", "true"])
+            .current_dir(path)
+            .output();
 
         Self::open(path)
     }
@@ -87,6 +94,13 @@ impl GitScm {
             .output();
         let _ = Command::new("git")
             .args(["config", "user.email", "claude-code-sync@local"])
+            .current_dir(path)
+            .output();
+        // Session ids, escaped project names and tool-result files easily pass
+        // Windows' 260-character limit, which Git for Windows enforces unless
+        // core.longpaths is on. Other platforms ignore the setting.
+        let _ = Command::new("git")
+            .args(["config", "core.longpaths", "true"])
             .current_dir(path)
             .output();
 
