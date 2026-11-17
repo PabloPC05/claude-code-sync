@@ -13,7 +13,7 @@
 //!
 //! Everything this module writes is produced by pure functions of the paths
 //! and settings involved, which the tests check for every platform; only
-//! [`install`], [`uninstall`] and [`status`] touch the machine.
+//! `install`, `uninstall` and `status` touch the machine.
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;

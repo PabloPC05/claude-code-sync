@@ -13,7 +13,7 @@
 //!   metadata lines;
 //! - both added messages: the side whose first new entry is older keeps the
 //!   session, and the other side's file becomes a new session — same
-//!   content, `sessionId` rewritten, titled "<title> (rama paralela)".
+//!   content, `sessionId` rewritten, titled `<title> (rama paralela)`.
 //!
 //! Every outcome is a pure function of the two files: no host names, no
 //! clocks. Two machines that reconcile the same pair write the same bytes,

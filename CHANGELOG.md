@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased (fork: roots, parallel branches, autosync)
+
+Fork of perfectra1n/claude-code-sync v0.4.1.
+
+### Features
+
+* **project_map:** root map — `config --map-root <id>=<path>` / `--unmap-root <id>`; every project below a mapped folder syncs as `@<id>@<path below it>` and lands in each machine's own encoded directory; the home directory is the implicit root `home` (`auto_home_root`, `--auto-home-root`)
+* **pull:** a session continued on two machines is split into the session and a deterministic parallel branch (`<title> (rama paralela)`) instead of being merged into one file; fast-forwards and metadata-only changes settle without a branch; live sessions are deferred; transcripts leave git's union merge so the sync repository never interleaves them; `pull -i` offers "parallel branch" first
+* **autosync:** `autosync install|uninstall|status|run` — LaunchAgent, systemd user timer (or a crontab line) or a hidden Task Scheduler task, plus a `SessionEnd` hook; raises Claude Code's `cleanupPeriodDays` to 3650; one run at a time through a lock file; never prompts
+* **config:** new configs allow transcripts up to 95 MiB, and an oversized transcript is reported in the log too
+
+### Bug Fixes
+
+* **project_map:** encode project paths longer than 200 characters the way Claude Code does (cut and hashed)
+* **project_map:** a project only pulled so far is pushed back under its root name, not duplicated under the local encoded name
+* **filter:** include/exclude patterns apply to a project's attachments, session sidecar directories and memory, in push, pull, status and purge; excluded projects are not reported for size
+* **merge:** a smart-merged transcript ends with the `last-prompt` of its most recent branch, so resume continues the newest one
+
 ## [0.4.1](https://github.com/perfectra1n/claude-code-sync/compare/v0.4.0...v0.4.1) (2026-10-10)
 
 

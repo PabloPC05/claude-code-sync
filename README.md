@@ -22,9 +22,12 @@ cargo doc --open --no-deps --all-features
 
 | Feature | Description |
 |---------|-------------|
-| **Smart Merge** | Automatically combines non-conflicting conversation changes |
+| **Parallel Branches** | A chat continued on two machines becomes two sessions Claude Code can resume, instead of one file that hides a branch |
+| **Root Map** | Map a projects folder once per machine; every project under it, new ones included, syncs across OSes and user names |
+| **Autosync** | A timer plus a Claude Code `SessionEnd` hook sync on their own, without prompts, one run at a time |
 | **Artifact Sync** | Carry settings, skills, agents, commands, rules, hooks, plugin manifests, plans, todos, and prompt history across machines |
 | **Project Map** | Pin a project to its path per machine, so renamed or relocated checkouts stay one project |
+| **Smart Merge** | Subagent transcripts edited on two machines are combined by message tree |
 | **Neutral Paths** | Synced config files store `__HOME__` / `__CLAUDE_DIR__` instead of this machine's absolute paths |
 | **Deletion Mirroring** | Deleting a skill, agent, command, rule or hook propagates, guarded so a fresh machine can never wipe the repo |
 | **External Merge Tool** | Resolve a differing file in a real three-way merge window instead of picking a side |
@@ -63,7 +66,162 @@ Claude Code stores conversation history locally in `~/.claude/projects/` as JSON
 3. Commits and optionally pushes to a remote
 4. On pull, merges remote changes with local history
 5. Detects conflicts (same session modified on different machines)
-6. Resolves conflicts by keeping both versions with renamed files
+6. Fast-forwards a session only one machine continued, and splits one both
+   continued into two sessions (see [Parallel branches](#parallel-branches-a-chat-continued-on-both-machines))
+
+## Fork additions: root map, parallel branches, autosync
+
+This fork is for one person who works on two or more machines — possibly on
+different operating systems, with different user names and home paths — keeps
+every project under one folder that keeps getting new projects, and wants the
+conversation history to follow without per-project setup and without running
+anything by hand.
+
+### Root map: every project under a folder, zero setup
+
+Map the folder that holds your projects once per machine, under the same id:
+
+```bash
+# Windows laptop
+claude-code-sync config --map-root "proyectos=C:\Users\Mateo\Documents\proyectos"
+# Windows desktop, another profile name and Documents redirected by OneDrive
+claude-code-sync config --map-root "proyectos=C:\Users\mateo.bodenlle\OneDrive\Documentos\proyectos"
+# a Mac or Linux machine
+claude-code-sync config --map-root proyectos=/Users/mateo/proyectos
+
+claude-code-sync config --unmap-root proyectos       # drop it
+claude-code-sync config --show                       # roots in effect
+```
+
+Every project below a root is stored in the sync repository as one directory,
+`@<root>@<path below the root>`, and each machine materializes it under its own
+root, in the directory name Claude Code itself uses there. A project created
+tomorrow syncs with no further setup.
+
+| On the machine that pushes | In the repository | On a machine mapping `proyectos` elsewhere |
+|---|---|---|
+| `/Users/mateo/proyectos/jarvis` | `@proyectos@jarvis` | `C:\Users\Mateo\proyectos\jarvis` → `C--Users-Mateo-proyectos-jarvis` |
+| `C:\Users\Mateo\proyectos\clientes\acme` | `@proyectos@clientes%2Facme` | `/home/mateo/proyectos/clientes/acme` → `-home-mateo-proyectos-clientes-acme` |
+| `/home/mateo/proyectos` (the root itself) | `@proyectos@` | the root itself |
+
+- **The path below the root** uses `/` and is escaped into a single portable
+  directory name: `%` → `%25`, `/` → `%2F`, and the characters Windows forbids
+  in a name (`\ : * ? " < > |`, a trailing dot or space) → `%XX`.
+- **The home directory is the implicit root `home`** (`auto_home_root = true`),
+  so a chat started anywhere under your home is portable too. Map `home`
+  explicitly to point it elsewhere, or turn it off with
+  `config --auto-home-root false`.
+- **Precedence** when naming a project directory: the project map (exact path),
+  then the longest matching root, then `use_project_name_only`, then the
+  encoded directory name (upstream behavior). Sessions, their `<sessionId>/`
+  sidecar directories (tool results, subagents) and the project's `memory/`
+  all go through the same naming, in both directions.
+- **A project's real path** is read from the `cwd` its transcripts record (the
+  one that encodes back to the directory's name). A project that has only been
+  pulled so far records the other machine's paths; its trailing components are
+  then tried under this machine's roots, so it is pushed back under the same
+  name instead of being duplicated.
+- **Windows**: root matching is case-insensitive, drive letter included
+  (`c:\` and `C:\`), and accepts `\` or `/`; a pulled project is materialized
+  with the root spelled as you configured it.
+- **A root this machine has not mapped** is skipped, with the usual one-line
+  warning naming the root and the `--map-root` remedy.
+- **Long paths**: Claude Code shortens a project directory name past 200
+  characters and appends a hash; this fork computes the same name (upstream
+  wrote such projects to a directory Claude Code never reads).
+
+Upgrading an existing sync repository: projects under a root (including the
+implicit `home`) are pushed under their new `@root@...` names from now on; the
+old encoded copies stay in the repository and are harmless.
+
+### Parallel branches: a chat continued on both machines
+
+Claude Code shows and resumes only the latest branch of a transcript (the leaf
+named by its last `last-prompt` record). Merging two machines' continuations
+into one file, as upstream's smart merge does, therefore hides one machine's
+messages. A transcript that differs from the repository copy is reconciled by
+entry instead (an entry's `uuid`, or its exact line when it has none):
+
+| Situation | Result |
+|---|---|
+| Every local entry is in the repository copy | take the repository copy (fast-forward) |
+| Every repository entry is already here | keep the local copy |
+| One side added messages, the other only metadata (a title) | the message side's file plus the other side's metadata lines |
+| Both sides added messages | **split**: one session, one parallel branch |
+
+On a split, the side whose first new entry is older keeps the session (ties go
+to the smaller `uuid`). The other side's whole file becomes a new session
+beside it, with id `UUIDv5(fixed namespace, "<session>:<uuid of its first new
+entry>")`, every `sessionId` rewritten, its own `last-prompt` kept, and a
+`custom-title` record appended: `<title> (rama paralela)`, where the title is
+the session's last custom title, else its generated title, else the first 60
+characters of its first message. The session's sidecar directory is copied to
+the branch's. Both are listed by `/resume` in that project, and `claude --resume <id>` opens either.
+
+Every result is a pure function of the two files — no host names, no clocks —
+so both machines compute the same bytes, converge, and the next sync is a
+no-op. The repository itself never interleaves two continuations either:
+transcripts are taken out of git's union merge (`projects/*/*.jsonl -merge` in
+`.gitattributes`), and a merge of the sync repository settles them the same way.
+
+- **Live sessions are never rewritten.** A session whose
+  `~/.claude/sessions/<pid>.json` names a running process is deferred
+  ("Deferred N live session(s)") and settled on a later sync; pushing its
+  current file is fine.
+- `pull -i` / `sync -i` in a terminal ask about each diverged session, with
+  "parallel branch" first beside upstream's smart merge / local / remote / both.
+- Subagent transcripts (inside a session's directory) still use the smart
+  merge, which now ends a merged file with the `last-prompt` of its most recent
+  branch.
+
+### Autosync
+
+```bash
+claude-code-sync autosync install [--interval-minutes 10] [--no-hooks] [--dry-run]
+claude-code-sync autosync status
+claude-code-sync autosync uninstall [--dry-run]
+```
+
+`install` schedules `claude-code-sync autosync run` every N minutes (default
+10) and, unless `--no-hooks`, adds a Claude Code `SessionEnd` hook so a chat
+you close is pushed right away. `--dry-run` prints every file and command
+without touching anything.
+
+| OS | Timer | Output |
+|---|---|---|
+| macOS | LaunchAgent `~/Library/LaunchAgents/io.github.claude-code-sync.autosync.plist` (`StartInterval`, `RunAtLoad`), loaded with `launchctl bootstrap gui/<uid>` | `~/Library/Logs/claude-code-sync.log` |
+| Linux | systemd user `claude-code-sync-autosync.service` + `.timer` in `~/.config/systemd/user/`, `systemctl --user enable --now`; without systemd, a crontab line to add | `<config dir>/autosync.log` |
+| Windows | Task Scheduler task "claude-code-sync autosync" every N minutes for the current user, running `wscript.exe "<config dir>\autosync.vbs"` (UTF-16, window style 0: no console ever flashes) | `<config dir>\autosync.log` |
+
+The hook is merged into `~/.claude/settings.json` beside any hooks you already
+have, using Claude Code's schema
+(`"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "...", "timeout": 30}]}]}`),
+and runs `<binary> autosync run --detach`, which starts the sync in its own
+process group and returns at once. The same edit raises `cleanupPeriodDays` to
+3650 when it is missing or lower (also with `--no-hooks`): Claude Code
+otherwise deletes transcripts older than 30 days on its own. Other members keep
+their order and text; the file is written as UTF-8 without BOM. `uninstall`
+removes only autosync's hook, and leaves `cleanupPeriodDays` alone.
+
+`autosync run` never prompts, exits 0 when there is nothing to do, and takes an
+exclusive lock on `sync.lock` in the config directory: when the timer and the
+hook fire together, the second run leaves quietly. A `sync`, `pull`, `push` or
+`purge` you start by hand waits for a running one.
+
+If you also sync the `settings` artifact category, the hook's absolute binary
+path travels with `settings.json`; run `autosync install` again on each machine
+after a pull that changed it.
+
+### Other changes in this fork
+
+- `init` and onboarding write `max_file_size_bytes = 95 MiB` for new configs
+  (GitHub refuses files over 100 MB); a transcript over the limit is reported on
+  the console and in the log file. Existing configs keep their value.
+- Include/exclude patterns (and `exclude_older_than_days` where it applies)
+  select whole projects: a session's sidecar directory follows its transcript,
+  a project's `memory/` and other files follow the project directory, in push,
+  pull, status and purge. A repository file is judged where it would land on
+  this machine. Projects the patterns leave out are never reported for size.
 
 ## Artifact Sync
 
@@ -169,7 +327,9 @@ When both machines committed different versions of a file to the sync
 repository itself, a pull no longer stops for good: a file whose versions
 differ only in date-times keeps the later ones, and in a terminal every other
 file asks which version to keep. Without a terminal the merge is undone and
-nothing is written.
+nothing is written — except session transcripts, which are settled without
+asking, the way a pull settles them (see
+[Parallel branches](#parallel-branches-a-chat-continued-on-both-machines)).
 
 > **Note (Git LFS):** if your `lfs_patterns` include `*.jsonl`, the repo copy
 > of `history.jsonl` is LFS-tracked; content is materialized on checkout, so
@@ -678,6 +838,9 @@ claude-code-sync config [OPTIONS] [--show]
 - `--sync-subdirectory <DIR>`: Subdirectory within sync repo for projects (default: `projects`)
 - `--enable-artifacts <NAMES>`: Enable artifact categories (comma-separated, or `all`)
 - `--disable-artifacts <NAMES>`: Disable artifact categories (comma-separated, or `all`)
+- `--map-project <ID=PATH>` / `--unmap-project <ID>`: Map a single project (see [Project map](#project-map-machines-that-keep-projects-elsewhere))
+- `--map-root <ID=PATH>` / `--unmap-root <ID>`: Map a folder of projects (see [Root map](#root-map-every-project-under-a-folder-zero-setup))
+- `--auto-home-root <true|false>`: Treat the home directory as the implicit root `home` (default: `true`)
 - `--show`: Show current configuration
 
 **Examples:**
@@ -878,6 +1041,18 @@ Each history entry shows:
 - Up to 5 operations are kept (automatically rotated)
 - Each operation includes details about affected conversations
 
+### `autosync`
+
+Sync on a timer and whenever a Claude Code chat ends; see
+[Autosync](#autosync).
+
+```bash
+claude-code-sync autosync install --interval-minutes 10 --dry-run   # show what it would do
+claude-code-sync autosync install                                   # do it
+claude-code-sync autosync status
+claude-code-sync autosync uninstall
+```
+
 ### `self-update`
 
 Update the installed binary to the latest release. It downloads the build for
@@ -904,34 +1079,40 @@ binary anyway.
 
 When the same conversation session is modified on different machines, `claude-code-sync` detects this as a conflict.
 
-### Smart Merge (NEW!)
+### Default: fast-forward, or split into a parallel branch
 
-**Smart merge is now the default conflict resolution strategy!** When conflicts are detected, `claude-code-sync` automatically attempts to intelligently merge both versions by:
+A session transcript that differs from the repository copy is fast-forwarded,
+kept, or — when both machines added messages — split into the session and a
+parallel branch, without asking (see
+[Parallel branches](#parallel-branches-a-chat-continued-on-both-machines)).
+Upstream's smart merge into one file is no longer the default for sessions:
+Claude Code would show only one of the merged branches.
+
+### Smart Merge (subagent transcripts, and on request)
+
+Subagent transcripts that differ, and sessions for which you pick "smart merge"
+in `pull -i`, are combined by:
 
 - **Analyzing message UUIDs and parent relationships**: Builds a message tree to understand conversation structure
 - **Resolving edited messages by timestamp**: If the same message was edited on both machines, keeps the newer version
 - **Preserving all conversation branches**: When conversations diverge (same parent, different continuations), keeps all branches intact
 - **Handling entries without UUIDs**: Falls back to timestamp-based merging for system events
 
-**Smart merge automatically handles:**
-- ✅ Non-overlapping changes (simple merge)
-- ✅ Message additions to different parts of the conversation
-- ✅ Conversation branches (multiple continuations from the same point)
-- ✅ Edited messages (resolved by timestamp)
-- ✅ Mixed UUID and non-UUID entries
-
-If smart merge fails (e.g., due to corrupted data), the system falls back to interactive or "keep both" resolution.
+A merged file ends with the `last-prompt` record of its most recently written
+branch, which is the one Claude Code resumes. If smart merge fails (e.g., due
+to corrupted data), the system falls back to interactive or "keep both"
+resolution.
 
 ### Interactive Conflict Resolution (New!)
 
-When running in an interactive terminal, `claude-code-sync` now provides a **TUI (Text User Interface)** for resolving conflicts:
+With `-i` in an interactive terminal, `claude-code-sync` provides a **TUI (Text User Interface)** for each session continued on both machines, and for subagent transcripts a smart merge could not combine:
 
 ```bash
 # Pull with interactive conflict resolution
-claude-code-sync pull
+claude-code-sync pull -i
 
 # Or sync (pull + push)
-claude-code-sync sync
+claude-code-sync sync -i
 ```
 
 **Interactive Features:**
@@ -939,7 +1120,8 @@ claude-code-sync sync
 - 🔍 **Preview differences** between local and remote versions
 - 📊 **View statistics**: message counts, timestamps, file sizes
 - 🎯 **Choose resolution per conflict**:
-  - **Smart Merge** (combine both versions - recommended) ✨ NEW
+  - **Parallel Branch** (sessions only, offered first: the later continuation becomes its own session)
+  - **Smart Merge** (combine both versions into one file)
   - Keep Local (discard remote changes)
   - Keep Remote (overwrite local file)
   - Keep Both (save remote with conflict suffix)
@@ -987,20 +1169,14 @@ Resolve:
 
 ### Automatic Resolution (Non-Interactive)
 
-When not in an interactive terminal (CI/CD, scripts), conflicts are automatically resolved:
+When not in an interactive terminal (CI/CD, scripts, autosync), sessions are
+fast-forwarded or split into parallel branches as described above, and a
+conflict report is generated (`claude-code-sync report`).
 
-**Resolution Strategy:**
+Only a subagent transcript whose smart merge fails still falls back to keeping
+both versions:
 - Local version: Kept as-is
 - Remote version: Saved with suffix `-conflict-<timestamp>.jsonl`
-- A detailed conflict report is generated
-
-**Example:**
-
-If session `abc-123.jsonl` conflicts:
-- Local: `~/.claude/projects/my-project/abc-123.jsonl` (unchanged)
-- Remote: `~/.claude/projects/my-project/abc-123-conflict-20250117-143022.jsonl` (saved separately)
-
-You can then manually review both versions and decide which to keep.
 
 ## Configuration File
 
@@ -1016,8 +1192,9 @@ include_patterns = ["*my-project*", "*work*"]
 # Exclude these project path patterns
 exclude_patterns = ["*test*", "*temp*"]
 
-# Maximum file size in bytes (10MB default)
-max_file_size_bytes = 10485760
+# Maximum file size in bytes (10 MB when the key is missing; init and
+# onboarding write 95 MiB, under GitHub's 100 MB limit)
+max_file_size_bytes = 99614720
 
 # Exclude file attachments (images, PDFs, etc.)
 exclude_attachments = false
@@ -1066,9 +1243,16 @@ plans = false
 todos = false
 prompt_history = true
 
+# The home directory is the implicit root `home` (see Root map)
+auto_home_root = true
+
 # Canonical project id -> this machine's path for it (see Project map)
 [project_map]
 shop = "/home/user/work/shop-web"
+
+# Root id -> this machine's folder of projects (see Root map)
+[root_map]
+proyectos = "/home/user/proyectos"
 ```
 
 ## Sync State
