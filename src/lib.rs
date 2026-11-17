@@ -165,6 +165,14 @@ pub mod report;
 /// the install (Nix, Homebrew, Scoop, cargo).
 pub mod self_update;
 
+/// One sync at a time per machine: an exclusive lock on a file in the
+/// config directory, taken by every run that writes.
+pub mod sync_lock;
+
+/// Automatic sync: a timer (LaunchAgent, systemd user timer or Task
+/// Scheduler task) plus a Claude Code `SessionEnd` hook.
+pub mod autosync;
+
 /// Core synchronization logic for pushing and pulling conversation history.
 ///
 /// Implements the main sync operations:

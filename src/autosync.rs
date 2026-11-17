@@ -1,0 +1,1512 @@
+//! Automatic sync: a timer that runs `autosync run` every few minutes, plus
+//! a Claude Code `SessionEnd` hook that runs it as soon as a chat closes.
+//!
+//! - macOS: a LaunchAgent, loaded with `launchctl bootstrap gui/<uid>`.
+//! - Linux: a systemd user service and timer (a crontab line when systemd
+//!   is not there).
+//! - Windows: a Task Scheduler task running a `.vbs` wrapper through
+//!   `wscript.exe`, so no console window ever flashes.
+//!
+//! `autosync run` never prompts, exits 0 when there is nothing to do, and
+//! takes the machine's sync lock: when the timer and the hook fire together,
+//! the second run finds the lock taken and quietly leaves.
+//!
+//! Everything this module writes is produced by pure functions of the paths
+//! and settings involved, which the tests check for every platform; only
+//! [`install`], [`uninstall`] and [`status`] touch the machine.
+
+use anyhow::{bail, Context, Result};
+use colored::Colorize;
+use serde_json::value::RawValue;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// The LaunchAgent label, also its plist's file name.
+pub const LAUNCHD_LABEL: &str = "io.github.claude-code-sync.autosync";
+
+/// The systemd user units' base name.
+pub const SYSTEMD_UNIT: &str = "claude-code-sync-autosync";
+
+/// The Task Scheduler task's name.
+pub const WINDOWS_TASK: &str = "claude-code-sync autosync";
+
+/// What the hook runs, after the executable: a detached `autosync run`, so
+/// closing a chat is never held up by a sync. Also how our hook is told
+/// apart from everyone else's.
+pub const HOOK_ARGUMENTS: &str = "autosync run --detach";
+
+/// Seconds Claude Code gives the hook; the detached launch takes far less.
+pub const HOOK_TIMEOUT_SECONDS: u64 = 30;
+
+/// The retention `autosync install` asks Claude Code for: it otherwise
+/// deletes transcripts older than 30 days on its own, on one machine.
+pub const RETENTION_DAYS: u64 = 3650;
+
+/// Default timer interval, in minutes.
+pub const DEFAULT_INTERVAL_MINUTES: u32 = 10;
+
+/// The longest interval `schtasks /SC MINUTE` accepts, and so the limit on
+/// every platform.
+pub const MAX_INTERVAL_MINUTES: u32 = 1439;
+
+/// Environment passed through to the timer's runs when set at install time,
+/// so a timer run reads the same configuration as the install did.
+const PASSED_THROUGH_ENV: &[&str] = &[
+    "CLAUDE_CODE_SYNC_CONFIG_DIR",
+    "CLAUDE_CODE_SYNC_CLAUDE_DIR",
+    "CLAUDE_CODE_SYNC_HOME",
+];
+
+/// The operating systems autosync knows how to schedule on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    MacOs,
+    Linux,
+    Windows,
+}
+
+impl Platform {
+    pub fn current() -> Platform {
+        if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else if cfg!(windows) {
+            Platform::Windows
+        } else {
+            Platform::Linux
+        }
+    }
+}
+
+/// Where the pieces live on one machine.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub platform: Platform,
+    /// The binary the timer and the hook run.
+    pub exe: PathBuf,
+    pub home: PathBuf,
+    /// claude-code-sync's config directory (Windows keeps the `.vbs` here).
+    pub config_dir: PathBuf,
+    /// `~/.config` or `$XDG_CONFIG_HOME` (Linux: where systemd user units go).
+    pub xdg_config_home: PathBuf,
+    /// Claude Code's `settings.json`.
+    pub claude_settings: PathBuf,
+    /// The user id `launchctl` addresses the GUI domain by (macOS).
+    pub uid: u32,
+    /// `PATH` and the passed-through variables, for the timer's runs.
+    pub env: Vec<(String, String)>,
+}
+
+impl Layout {
+    /// This machine's layout.
+    pub fn detect() -> Result<Layout> {
+        let home = crate::sync::discovery::machine_home_dir().context("No home directory")?;
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let mut env = Vec::new();
+        if let Ok(path) = std::env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+        for name in PASSED_THROUGH_ENV {
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() {
+                    env.push((name.to_string(), value));
+                }
+            }
+        }
+        Ok(Layout {
+            platform: Platform::current(),
+            exe: std::env::current_exe().context("Cannot tell where this binary is")?,
+            home,
+            config_dir: crate::config::ConfigManager::config_dir()?,
+            xdg_config_home,
+            claude_settings: crate::sync::discovery::claude_home_dir()?.join("settings.json"),
+            uid: current_uid(),
+            env,
+        })
+    }
+
+    /// Where autosync's runs write their output.
+    pub fn log_path(&self) -> PathBuf {
+        match self.platform {
+            Platform::MacOs => self.home.join("Library/Logs/claude-code-sync.log"),
+            Platform::Linux | Platform::Windows => self.config_dir.join("autosync.log"),
+        }
+    }
+
+    pub fn plist_path(&self) -> PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist"))
+    }
+
+    pub fn systemd_dir(&self) -> PathBuf {
+        self.xdg_config_home.join("systemd/user")
+    }
+
+    pub fn vbs_path(&self) -> PathBuf {
+        self.config_dir.join("autosync.vbs")
+    }
+
+    fn exe_text(&self) -> String {
+        self.exe.to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: getuid(2) cannot fail and has no side effects.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// A command the install or uninstall runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCommand {
+    pub args: Vec<String>,
+    /// Failing is expected sometimes (unloading what is not loaded).
+    pub may_fail: bool,
+}
+
+impl PlannedCommand {
+    fn new(args: &[&str], may_fail: bool) -> Self {
+        PlannedCommand {
+            args: args.iter().map(|a| a.to_string()).collect(),
+            may_fail,
+        }
+    }
+
+    /// The command as one could type it, for `--dry-run`.
+    pub fn display(&self) -> String {
+        self.args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') || a.contains('"') {
+                    format!("'{a}'")
+                } else {
+                    a.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Everything one install or uninstall does to the machine, before it does
+/// any of it.
+#[derive(Debug, Default)]
+pub struct Plan {
+    /// Files to write, with their bytes.
+    pub writes: Vec<(PathBuf, Vec<u8>)>,
+    /// Files to delete.
+    pub removals: Vec<PathBuf>,
+    /// Directories that must exist first.
+    pub directories: Vec<PathBuf>,
+    pub commands: Vec<PlannedCommand>,
+    /// The new `settings.json`, when it changes, and what changed in it.
+    pub settings: Option<(String, Vec<String>)>,
+}
+
+// ---------------------------------------------------------------------------
+// Generated files
+// ---------------------------------------------------------------------------
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The LaunchAgent: `autosync run` at load and every `interval_minutes`.
+pub fn launchd_plist(layout: &Layout, interval_minutes: u32) -> String {
+    let exe = xml_escape(&layout.exe_text());
+    let log = xml_escape(&layout.log_path().to_string_lossy());
+    let mut env = String::new();
+    for (name, value) in &layout.env {
+        env.push_str(&format!(
+            "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+            xml_escape(name),
+            xml_escape(value)
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{LAUNCHD_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{exe}</string>
+		<string>autosync</string>
+		<string>run</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>{seconds}</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>{log}</string>
+	<key>StandardErrorPath</key>
+	<string>{log}</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+{env}	</dict>
+</dict>
+</plist>
+"#,
+        seconds = u64::from(interval_minutes) * 60,
+    )
+}
+
+/// A word of a systemd unit line, quoted: `%` is a specifier there.
+fn systemd_quote(word: &str) -> String {
+    let escaped = word
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+/// The systemd user service: one `autosync run`.
+pub fn systemd_service(layout: &Layout) -> String {
+    let log = layout.log_path().to_string_lossy().replace('%', "%%");
+    let mut env = String::new();
+    for (name, value) in &layout.env {
+        env.push_str(&format!(
+            "Environment={}\n",
+            systemd_quote(&format!("{name}={value}"))
+        ));
+    }
+    format!(
+        "[Unit]\n\
+         Description=Sync Claude Code history (claude-code-sync autosync)\n\
+         After=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={} autosync run\n\
+         {env}\
+         StandardOutput=append:{log}\n\
+         StandardError=append:{log}\n",
+        systemd_quote(&layout.exe_text()),
+    )
+}
+
+/// The systemd user timer that starts the service every `interval_minutes`.
+pub fn systemd_timer(interval_minutes: u32) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Run claude-code-sync autosync every {interval_minutes} minutes\n\
+         \n\
+         [Timer]\n\
+         OnBootSec=2min\n\
+         OnUnitActiveSec={interval_minutes}min\n\
+         Unit={SYSTEMD_UNIT}.service\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n"
+    )
+}
+
+/// Quote a word for a POSIX shell.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// The crontab line for a Linux machine without systemd.
+pub fn crontab_line(layout: &Layout, interval_minutes: u32) -> String {
+    let schedule = if interval_minutes < 60 {
+        format!("*/{interval_minutes} * * * *")
+    } else {
+        format!("0 */{} * * *", (interval_minutes / 60).clamp(1, 23))
+    };
+    format!(
+        "{schedule} {} autosync run >> {} 2>&1",
+        shell_quote(&layout.exe_text()),
+        shell_quote(&layout.log_path().to_string_lossy())
+    )
+}
+
+/// The `.vbs` the Windows task runs: the binary, with no window at all.
+pub fn windows_vbs(layout: &Layout) -> String {
+    // A VBScript string doubles its quotes; the outer pair quotes the path.
+    let command = format!("\"{}\" {HOOK_ARGUMENTS}", layout.exe_text()).replace('"', "\"\"");
+    format!(
+        "' claude-code-sync autosync: one sync, with no console window.\r\n\
+         ' Written by `claude-code-sync autosync install`, removed by `autosync uninstall`.\r\n\
+         CreateObject(\"WScript.Shell\").Run \"{command}\", 0, False\r\n"
+    )
+}
+
+/// UTF-16LE with a byte-order mark: the encoding `wscript.exe` reads any
+/// path in, whatever the machine's code page (a user named Iñaki).
+pub fn utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// `schtasks` arguments creating the task: every `interval_minutes`, for
+/// the current user, running the `.vbs` through `wscript.exe`.
+pub fn schtasks_create(layout: &Layout, interval_minutes: u32) -> PlannedCommand {
+    let action = format!("wscript.exe \"{}\"", layout.vbs_path().to_string_lossy());
+    let interval = interval_minutes.to_string();
+    PlannedCommand::new(
+        &[
+            "schtasks",
+            "/Create",
+            "/SC",
+            "MINUTE",
+            "/MO",
+            &interval,
+            "/TN",
+            WINDOWS_TASK,
+            "/TR",
+            &action,
+            "/F",
+        ],
+        false,
+    )
+}
+
+/// The command the `SessionEnd` hook runs, quoted for the shell Claude Code
+/// hands it to. On Windows the path uses forward slashes, which `cmd.exe`
+/// and Git Bash both take inside double quotes.
+pub fn hook_command(platform: Platform, exe: &Path) -> String {
+    let exe = exe.to_string_lossy();
+    match platform {
+        Platform::Windows => format!("\"{}\" {HOOK_ARGUMENTS}", exe.replace('\\', "/")),
+        Platform::MacOs | Platform::Linux => format!("{} {HOOK_ARGUMENTS}", shell_quote(&exe)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// settings.json
+// ---------------------------------------------------------------------------
+
+/// A JSON object's members in file order, each value as its own text, so a
+/// rewrite leaves every member it does not touch exactly as it was.
+struct OrderedObject(Vec<(String, Box<RawValue>)>);
+
+impl<'de> serde::Deserialize<'de> for OrderedObject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = OrderedObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<OrderedObject, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry::<String, Box<RawValue>>()? {
+                    members.push(member);
+                }
+                Ok(OrderedObject(members))
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
+}
+
+/// `settings.json` as members in order, ready to change a few of them.
+struct Settings {
+    members: Vec<(String, String)>,
+    trailing_newline: bool,
+}
+
+impl Settings {
+    fn parse(original: Option<&str>) -> Result<Settings> {
+        let text = original.unwrap_or("").trim_start_matches('\u{feff}');
+        if text.trim().is_empty() {
+            return Ok(Settings {
+                members: Vec::new(),
+                trailing_newline: true,
+            });
+        }
+        let object: OrderedObject = serde_json::from_str(text)
+            .context("Claude Code's settings.json is not a JSON object; fix it first")?;
+        Ok(Settings {
+            members: object
+                .0
+                .into_iter()
+                .map(|(key, value)| (key, value.get().to_string()))
+                .collect(),
+            trailing_newline: text.ends_with('\n'),
+        })
+    }
+
+    fn get(&self, key: &str) -> Option<Value> {
+        self.members
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, raw)| serde_json::from_str(raw).ok())
+    }
+
+    /// Set a member, in place when it exists, at the end otherwise.
+    fn set(&mut self, key: &str, value: &Value) {
+        let text = indent_continuation(&serde_json::to_string_pretty(value).expect("serializes"));
+        match self.members.iter_mut().find(|(k, _)| k == key) {
+            Some((_, raw)) => *raw = text,
+            None => self.members.push((key.to_string(), text)),
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.members.retain(|(k, _)| k != key);
+    }
+
+    /// Two-space indentation, the way Claude Code writes the file.
+    fn render(&self) -> String {
+        let mut out = String::from("{");
+        for (index, (key, raw)) in self.members.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let key = serde_json::to_string(key).expect("a string serializes");
+            out.push_str(&format!("\n  {key}: {raw}"));
+        }
+        out.push_str(if self.members.is_empty() { "}" } else { "\n}" });
+        if self.trailing_newline {
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Indent every line but the first by two spaces: a pretty-printed value
+/// placed one level deep.
+fn indent_continuation(pretty: &str) -> String {
+    pretty.replace('\n', "\n  ")
+}
+
+/// Whether a hook entry is the one autosync installs.
+fn is_our_hook(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains(HOOK_ARGUMENTS))
+}
+
+/// Remove autosync's hooks from a `hooks` object; returns whether any was.
+fn remove_our_hooks(hooks: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(Value::Array(groups)) = hooks.get_mut("SessionEnd") else {
+        return false;
+    };
+    let mut removed = false;
+    groups.retain_mut(|group| {
+        let Some(Value::Array(entries)) = group.get_mut("hooks") else {
+            return true;
+        };
+        let before = entries.len();
+        entries.retain(|hook| !is_our_hook(hook));
+        if entries.len() == before {
+            return true;
+        }
+        removed = true;
+        !entries.is_empty()
+    });
+    if removed && groups.is_empty() {
+        hooks.remove("SessionEnd");
+    }
+    removed
+}
+
+/// `settings.json` after an install: the retention raised to
+/// [`RETENTION_DAYS`] when lower or missing, and — unless `hook` is `None`
+/// (`--no-hooks`) — exactly one `SessionEnd` hook of ours running `hook`.
+/// Every other member, and every other hook, is left as it was. `None` when
+/// nothing changes; otherwise the new text and what changed.
+pub fn settings_after_install(
+    original: Option<&str>,
+    hook: Option<&str>,
+) -> Result<Option<(String, Vec<String>)>> {
+    let mut settings = Settings::parse(original)?;
+    let mut changes = Vec::new();
+
+    let retention = settings.get("cleanupPeriodDays");
+    let current = retention.as_ref().and_then(Value::as_u64);
+    if current.is_none_or(|days| days < RETENTION_DAYS) {
+        settings.set("cleanupPeriodDays", &Value::from(RETENTION_DAYS));
+        changes.push(match current {
+            Some(days) => format!(
+                "cleanupPeriodDays {days} -> {RETENTION_DAYS} (Claude Code would delete older transcripts on its own)"
+            ),
+            None => format!(
+                "cleanupPeriodDays set to {RETENTION_DAYS} (Claude Code's default deletes transcripts after 30 days)"
+            ),
+        });
+    }
+
+    let hooks_before = settings.get("hooks");
+    let mut hooks = match &hooks_before {
+        Some(Value::Object(hooks)) => hooks.clone(),
+        Some(_) => {
+            bail!("settings.json has a \"hooks\" member that is not an object; fix it first")
+        }
+        None => serde_json::Map::new(),
+    };
+    let removed = remove_our_hooks(&mut hooks);
+    if let Some(command) = hook {
+        let ours = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": HOOK_TIMEOUT_SECONDS,
+            }]
+        });
+        let groups = hooks
+            .entry("SessionEnd")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(groups) = groups else {
+            bail!("settings.json has a \"hooks.SessionEnd\" that is not a list; fix it first");
+        };
+        groups.push(ours);
+    }
+    let hooks_changed = match &hooks_before {
+        Some(before) => *before != Value::Object(hooks.clone()),
+        None => !hooks.is_empty(),
+    };
+    if hooks_changed {
+        if hooks.is_empty() {
+            settings.remove("hooks");
+        } else {
+            settings.set("hooks", &Value::Object(hooks));
+        }
+        changes.push(match (hook, removed) {
+            (Some(command), false) => format!("SessionEnd hook added: {command}"),
+            (Some(command), true) => format!("SessionEnd hook updated: {command}"),
+            (None, _) => "SessionEnd hook removed (--no-hooks)".to_string(),
+        });
+    }
+
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((settings.render(), changes)))
+}
+
+/// `settings.json` after an uninstall: autosync's hook removed, nothing
+/// else — the retention stays raised, since lowering it would let Claude
+/// Code delete transcripts. `None` when there is no hook of ours.
+pub fn settings_after_uninstall(original: Option<&str>) -> Result<Option<(String, Vec<String>)>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let mut settings = Settings::parse(Some(original))?;
+    let Some(Value::Object(mut hooks)) = settings.get("hooks") else {
+        return Ok(None);
+    };
+    if !remove_our_hooks(&mut hooks) {
+        return Ok(None);
+    }
+    if hooks.is_empty() {
+        settings.remove("hooks");
+    } else {
+        settings.set("hooks", &Value::Object(hooks));
+    }
+    Ok(Some((
+        settings.render(),
+        vec!["SessionEnd hook removed".to_string()],
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Plans
+// ---------------------------------------------------------------------------
+
+/// What `autosync install` does on this layout. `settings_text` is the
+/// current `settings.json`, if any.
+pub fn install_plan(
+    layout: &Layout,
+    interval_minutes: u32,
+    hooks: bool,
+    settings_text: Option<&str>,
+) -> Result<Plan> {
+    if !(1..=MAX_INTERVAL_MINUTES).contains(&interval_minutes) {
+        bail!("--interval-minutes must be between 1 and {MAX_INTERVAL_MINUTES}");
+    }
+    let mut plan = Plan::default();
+    if let Some(log_dir) = layout.log_path().parent() {
+        plan.directories.push(log_dir.to_path_buf());
+    }
+    match layout.platform {
+        Platform::MacOs => {
+            let plist = layout.plist_path();
+            let domain = format!("gui/{}", layout.uid);
+            let service = format!("{domain}/{LAUNCHD_LABEL}");
+            plan.directories.push(plist.parent().unwrap().to_path_buf());
+            plan.writes.push((
+                plist.clone(),
+                launchd_plist(layout, interval_minutes).into_bytes(),
+            ));
+            plan.commands.push(PlannedCommand::new(
+                &["launchctl", "bootout", &service],
+                true,
+            ));
+            plan.commands.push(PlannedCommand::new(
+                &["launchctl", "bootstrap", &domain, &plist.to_string_lossy()],
+                false,
+            ));
+        }
+        Platform::Linux => {
+            let dir = layout.systemd_dir();
+            plan.directories.push(dir.clone());
+            plan.writes.push((
+                dir.join(format!("{SYSTEMD_UNIT}.service")),
+                systemd_service(layout).into_bytes(),
+            ));
+            plan.writes.push((
+                dir.join(format!("{SYSTEMD_UNIT}.timer")),
+                systemd_timer(interval_minutes).into_bytes(),
+            ));
+            plan.commands.push(PlannedCommand::new(
+                &["systemctl", "--user", "daemon-reload"],
+                false,
+            ));
+            plan.commands.push(PlannedCommand::new(
+                &[
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    &format!("{SYSTEMD_UNIT}.timer"),
+                ],
+                false,
+            ));
+        }
+        Platform::Windows => {
+            plan.directories.push(layout.config_dir.clone());
+            plan.writes
+                .push((layout.vbs_path(), utf16le_with_bom(&windows_vbs(layout))));
+            plan.commands
+                .push(schtasks_create(layout, interval_minutes));
+        }
+    }
+    let hook = hooks.then(|| hook_command(layout.platform, &layout.exe));
+    plan.settings = settings_after_install(settings_text, hook.as_deref())?;
+    Ok(plan)
+}
+
+/// What `autosync uninstall` does on this layout.
+pub fn uninstall_plan(layout: &Layout, settings_text: Option<&str>) -> Result<Plan> {
+    let mut plan = Plan::default();
+    match layout.platform {
+        Platform::MacOs => {
+            let service = format!("gui/{}/{LAUNCHD_LABEL}", layout.uid);
+            plan.commands.push(PlannedCommand::new(
+                &["launchctl", "bootout", &service],
+                true,
+            ));
+            plan.removals.push(layout.plist_path());
+        }
+        Platform::Linux => {
+            plan.commands.push(PlannedCommand::new(
+                &[
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    &format!("{SYSTEMD_UNIT}.timer"),
+                ],
+                true,
+            ));
+            let dir = layout.systemd_dir();
+            plan.removals
+                .push(dir.join(format!("{SYSTEMD_UNIT}.service")));
+            plan.removals
+                .push(dir.join(format!("{SYSTEMD_UNIT}.timer")));
+            plan.commands.push(PlannedCommand::new(
+                &["systemctl", "--user", "daemon-reload"],
+                true,
+            ));
+        }
+        Platform::Windows => {
+            plan.commands.push(PlannedCommand::new(
+                &["schtasks", "/Delete", "/TN", WINDOWS_TASK, "/F"],
+                true,
+            ));
+            plan.removals.push(layout.vbs_path());
+        }
+    }
+    plan.settings = settings_after_uninstall(settings_text)?;
+    Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// Doing it
+// ---------------------------------------------------------------------------
+
+fn read_settings(layout: &Layout) -> Result<Option<String>> {
+    match std::fs::read(&layout.claude_settings) {
+        Ok(bytes) => Ok(Some(String::from_utf8(bytes).with_context(|| {
+            format!("{} is not UTF-8", layout.claude_settings.display())
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to read {}", layout.claude_settings.display()))
+        }
+    }
+}
+
+fn print_plan(plan: &Plan, layout: &Layout) {
+    for dir in &plan.directories {
+        println!("  {} {}", "mkdir".dimmed(), dir.display());
+    }
+    for (path, bytes) in &plan.writes {
+        println!("  {} {}", "write".green(), path.display());
+        if layout.platform == Platform::Windows && path.extension().is_some_and(|e| e == "vbs") {
+            println!("{}", "    (UTF-16LE with BOM)".dimmed());
+            for line in windows_vbs(layout).lines() {
+                println!("    {line}");
+            }
+        } else {
+            for line in String::from_utf8_lossy(bytes).lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    for path in &plan.removals {
+        println!("  {} {}", "delete".red(), path.display());
+    }
+    for command in &plan.commands {
+        println!("  {} {}", "run".cyan(), command.display());
+    }
+    if let Some((_, changes)) = &plan.settings {
+        println!("  {} {}", "edit".green(), layout.claude_settings.display());
+        for change in changes {
+            println!("    {change}");
+        }
+    }
+}
+
+fn run_command(command: &PlannedCommand) -> Result<bool> {
+    let output = std::process::Command::new(&command.args[0])
+        .args(&command.args[1..])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(true),
+        Ok(output) if command.may_fail => {
+            log::debug!(
+                "{} failed (expected sometimes): {}",
+                command.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(false)
+        }
+        Ok(output) => bail!(
+            "{} failed: {}",
+            command.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(_) if command.may_fail => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Failed to run {}", command.display())),
+    }
+}
+
+fn apply_files(plan: &Plan, layout: &Layout) -> Result<()> {
+    for dir in &plan.directories {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    for (path, bytes) in &plan.writes {
+        std::fs::write(path, bytes)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    for path in &plan.removals {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to delete {}", path.display()))
+            }
+        }
+    }
+    if let Some((text, changes)) = &plan.settings {
+        if let Some(parent) = layout.claude_settings.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // UTF-8 without a BOM: `String` bytes are exactly that.
+        crate::branches::write_file(&layout.claude_settings, text.as_bytes())?;
+        for change in changes {
+            println!("  {} {}", "✓".green(), change);
+        }
+    }
+    Ok(())
+}
+
+/// `autosync install`.
+pub fn install(interval_minutes: u32, hooks: bool, dry_run: bool) -> Result<()> {
+    let layout = Layout::detect()?;
+    let settings = read_settings(&layout)?;
+    let plan = install_plan(&layout, interval_minutes, hooks, settings.as_deref())?;
+
+    if dry_run {
+        println!("{}", "autosync install --dry-run would:".bold());
+        print_plan(&plan, &layout);
+        if layout.platform == Platform::Linux {
+            println!(
+                "  {} without systemd, it would print this crontab line instead:\n    {}",
+                "note".dimmed(),
+                crontab_line(&layout, interval_minutes)
+            );
+        }
+        return Ok(());
+    }
+
+    if !crate::handlers::is_initialized()? {
+        println!(
+            "{} claude-code-sync is not initialized yet; autosync runs will do nothing until \
+             `claude-code-sync init` is done.",
+            "!".yellow()
+        );
+    }
+    apply_files(&plan, &layout)?;
+
+    let mut scheduled = true;
+    for command in &plan.commands {
+        let systemd = command.args.first().is_some_and(|c| c == "systemctl");
+        match run_command(command) {
+            Ok(_) => {}
+            Err(e) if systemd => {
+                log::warn!("{e:#}");
+                scheduled = false;
+                println!(
+                    "{} systemd user services are not available here ({}). Add this line to \
+                     your crontab (crontab -e) instead:\n  {}",
+                    "!".yellow(),
+                    e.to_string().lines().next().unwrap_or_default(),
+                    crontab_line(&layout, interval_minutes)
+                );
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if scheduled {
+        println!(
+            "{} autosync every {interval_minutes} minute(s): {}",
+            "✓".green(),
+            match layout.platform {
+                Platform::MacOs => format!("LaunchAgent {}", layout.plist_path().display()),
+                Platform::Linux => format!("systemd user timer {SYSTEMD_UNIT}.timer"),
+                Platform::Windows => format!("Task Scheduler task \"{WINDOWS_TASK}\""),
+            }
+        );
+    }
+    if hooks {
+        println!(
+            "{} a closed Claude Code chat syncs right away (SessionEnd hook)",
+            "✓".green()
+        );
+    }
+    println!("  Log: {}", layout.log_path().display());
+    Ok(())
+}
+
+/// `autosync uninstall`.
+pub fn uninstall(dry_run: bool) -> Result<()> {
+    let layout = Layout::detect()?;
+    let settings = read_settings(&layout)?;
+    let plan = uninstall_plan(&layout, settings.as_deref())?;
+    if dry_run {
+        println!("{}", "autosync uninstall --dry-run would:".bold());
+        print_plan(&plan, &layout);
+        return Ok(());
+    }
+    for command in &plan.commands {
+        run_command(command)?;
+    }
+    apply_files(&plan, &layout)?;
+    println!(
+        "{} autosync removed (cleanupPeriodDays is left as it is)",
+        "✓".green()
+    );
+    Ok(())
+}
+
+/// `autosync status`.
+pub fn status() -> Result<()> {
+    let layout = Layout::detect()?;
+    println!("{}", "=== Autosync ===".bold().cyan());
+    let (installed, scheduler) = match layout.platform {
+        Platform::MacOs => {
+            let loaded = run_command(&PlannedCommand::new(
+                &[
+                    "launchctl",
+                    "print",
+                    &format!("gui/{}/{LAUNCHD_LABEL}", layout.uid),
+                ],
+                true,
+            ))
+            .unwrap_or(false);
+            (
+                layout.plist_path().is_file(),
+                format!(
+                    "LaunchAgent {} ({})",
+                    layout.plist_path().display(),
+                    if loaded { "loaded" } else { "not loaded" }
+                ),
+            )
+        }
+        Platform::Linux => {
+            let active = run_command(&PlannedCommand::new(
+                &[
+                    "systemctl",
+                    "--user",
+                    "is-active",
+                    "--quiet",
+                    &format!("{SYSTEMD_UNIT}.timer"),
+                ],
+                true,
+            ))
+            .unwrap_or(false);
+            (
+                layout
+                    .systemd_dir()
+                    .join(format!("{SYSTEMD_UNIT}.timer"))
+                    .is_file(),
+                format!(
+                    "systemd user timer {SYSTEMD_UNIT}.timer ({})",
+                    if active { "active" } else { "inactive" }
+                ),
+            )
+        }
+        Platform::Windows => {
+            let exists = run_command(&PlannedCommand::new(
+                &["schtasks", "/Query", "/TN", WINDOWS_TASK],
+                true,
+            ))
+            .unwrap_or(false);
+            (
+                exists,
+                format!(
+                    "Task Scheduler task \"{WINDOWS_TASK}\" ({})",
+                    if exists { "present" } else { "absent" }
+                ),
+            )
+        }
+    };
+    println!(
+        "  Timer: {}",
+        if installed {
+            scheduler.green()
+        } else {
+            "not installed".yellow()
+        }
+    );
+
+    let settings: Option<Value> = read_settings(&layout)?
+        .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok());
+    let hooked = settings
+        .as_ref()
+        .and_then(|s| s.pointer("/hooks/SessionEnd"))
+        .and_then(|groups| groups.as_array())
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| hooks.iter().any(is_our_hook))
+            })
+        });
+    println!(
+        "  SessionEnd hook: {}",
+        if hooked {
+            "installed".green()
+        } else {
+            "not installed".yellow()
+        }
+    );
+    let retention = settings
+        .as_ref()
+        .and_then(|s| s.get("cleanupPeriodDays"))
+        .and_then(|d| d.as_u64());
+    println!(
+        "  Claude Code retention: {}",
+        match retention {
+            Some(days) if days >= RETENTION_DAYS => format!("{days} days").green(),
+            Some(days) => format!("{days} days (older transcripts are deleted locally)").yellow(),
+            None => "30 days (default; older transcripts are deleted locally)".yellow(),
+        }
+    );
+    let running = crate::sync_lock::SyncLock::try_acquire()?.is_none();
+    if running {
+        println!("  {}", "A sync is running right now".cyan());
+    }
+    println!("  Log: {}", layout.log_path().display());
+    Ok(())
+}
+
+/// `autosync run`: one non-interactive sync, unless another run holds the
+/// lock. With `detach`, start that in the background and return at once.
+pub fn run(detach: bool) -> Result<()> {
+    if detach {
+        return spawn_detached();
+    }
+    std::env::set_var(crate::interactive_conflict::NONINTERACTIVE_ENV, "1");
+
+    let Some(_lock) = crate::sync_lock::SyncLock::try_acquire()? else {
+        log::info!("autosync: another sync is running; leaving it to that one");
+        return Ok(());
+    };
+    if !crate::handlers::is_initialized()? {
+        log::info!("autosync: not initialized (run `claude-code-sync init`); nothing to do");
+        return Ok(());
+    }
+
+    println!(
+        "--- autosync {} ---",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    crate::sync::sync_bidirectional(None, None, false, false, crate::VerbosityLevel::Quiet)
+}
+
+/// Start `autosync run` in its own process group, output appended to the
+/// log, and return without waiting: what the `SessionEnd` hook and the
+/// Windows task launch.
+fn spawn_detached() -> Result<()> {
+    let layout = Layout::detect()?;
+    let log_path = layout.log_path();
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open {}", log_path.display()))?;
+
+    let mut command = std::process::Command::new(&layout.exe);
+    command
+        .args(["autosync", "run"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    detach(&mut command);
+    command
+        .spawn()
+        .with_context(|| format!("Failed to start {}", layout.exe.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // Its own session: closing the terminal or ending Claude Code does not
+    // take the sync down with it.
+    // SAFETY: setsid(2) is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    // A console with no window, inherited by git: nothing flashes on screen.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach(_command: &mut std::process::Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(platform: Platform) -> Layout {
+        match platform {
+            Platform::MacOs => Layout {
+                platform,
+                exe: PathBuf::from("/Users/mateo/.cargo/bin/claude-code-sync"),
+                home: PathBuf::from("/Users/mateo"),
+                config_dir: PathBuf::from(
+                    "/Users/mateo/Library/Application Support/claude-code-sync",
+                ),
+                xdg_config_home: PathBuf::from("/Users/mateo/.config"),
+                claude_settings: PathBuf::from("/Users/mateo/.claude/settings.json"),
+                uid: 501,
+                env: vec![(
+                    "PATH".to_string(),
+                    "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
+                )],
+            },
+            Platform::Linux => Layout {
+                platform,
+                exe: PathBuf::from("/home/mateo/bin/claude code sync"),
+                home: PathBuf::from("/home/mateo"),
+                config_dir: PathBuf::from("/home/mateo/.config/claude-code-sync"),
+                xdg_config_home: PathBuf::from("/home/mateo/.config"),
+                claude_settings: PathBuf::from("/home/mateo/.claude/settings.json"),
+                uid: 1000,
+                env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            },
+            // Stand-ins: the Windows path text is what matters, and a
+            // `PathBuf` keeps it verbatim on any platform.
+            Platform::Windows => Layout {
+                platform,
+                exe: PathBuf::from(
+                    r"C:\Users\Mateo Bodenlle\AppData\Local\Programs\claude-code-sync\claude-code-sync.exe",
+                ),
+                home: PathBuf::from(r"C:\Users\Mateo Bodenlle"),
+                config_dir: PathBuf::from(r"C:\Users\Iñaki\AppData\Roaming\claude-code-sync"),
+                xdg_config_home: PathBuf::from(r"C:\Users\Mateo Bodenlle\.config"),
+                claude_settings: PathBuf::from(r"C:\Users\Mateo Bodenlle\.claude\settings.json"),
+                uid: 0,
+                env: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_launch_agent_runs_at_load_and_every_interval_with_a_log() {
+        let mut mac = layout(Platform::MacOs);
+        mac.env.push((
+            "CLAUDE_CODE_SYNC_CONFIG_DIR".to_string(),
+            "/a&b".to_string(),
+        ));
+        let plist = launchd_plist(&mac, 15);
+
+        assert!(plist.contains("<string>io.github.claude-code-sync.autosync</string>"));
+        assert!(plist.contains(
+            "<array>\n\t\t<string>/Users/mateo/.cargo/bin/claude-code-sync</string>\n\
+             \t\t<string>autosync</string>\n\t\t<string>run</string>\n\t</array>"
+        ));
+        assert!(plist.contains("<key>StartInterval</key>\n\t<integer>900</integer>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(plist.contains(
+            "<key>StandardOutPath</key>\n\t<string>/Users/mateo/Library/Logs/claude-code-sync.log</string>"
+        ));
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin:/bin</string>"));
+        assert!(plist.contains("<string>/a&amp;b</string>"), "XML-escaped");
+    }
+
+    #[test]
+    fn the_mac_install_bootstraps_the_agent_in_the_gui_domain() {
+        let plan = install_plan(&layout(Platform::MacOs), 10, true, None).unwrap();
+        let commands: Vec<String> = plan.commands.iter().map(PlannedCommand::display).collect();
+        assert_eq!(
+            commands,
+            vec![
+                "launchctl bootout gui/501/io.github.claude-code-sync.autosync",
+                "launchctl bootstrap gui/501 /Users/mateo/Library/LaunchAgents/io.github.claude-code-sync.autosync.plist",
+            ]
+        );
+        assert!(plan.commands[0].may_fail && !plan.commands[1].may_fail);
+        assert_eq!(
+            plan.writes[0].0,
+            PathBuf::from(
+                "/Users/mateo/Library/LaunchAgents/io.github.claude-code-sync.autosync.plist"
+            )
+        );
+
+        let removal = uninstall_plan(&layout(Platform::MacOs), None).unwrap();
+        assert_eq!(removal.removals, vec![plan.writes[0].0.clone()]);
+        assert_eq!(
+            removal.commands[0].display(),
+            "launchctl bootout gui/501/io.github.claude-code-sync.autosync"
+        );
+    }
+
+    #[test]
+    fn the_systemd_units_run_one_sync_on_a_timer() {
+        let linux = layout(Platform::Linux);
+        let service = systemd_service(&linux);
+        assert!(service.contains("Type=oneshot\n"));
+        assert!(service.contains("ExecStart=\"/home/mateo/bin/claude code sync\" autosync run\n"));
+        assert!(service.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
+        assert!(service
+            .contains("StandardOutput=append:/home/mateo/.config/claude-code-sync/autosync.log\n"));
+
+        let timer = systemd_timer(10);
+        assert!(timer.contains("OnUnitActiveSec=10min\n"));
+        assert!(timer.contains("Unit=claude-code-sync-autosync.service\n"));
+        assert!(timer.contains("WantedBy=timers.target\n"));
+
+        let plan = install_plan(&linux, 10, false, None).unwrap();
+        let commands: Vec<String> = plan.commands.iter().map(PlannedCommand::display).collect();
+        assert_eq!(
+            commands,
+            vec![
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now claude-code-sync-autosync.timer",
+            ]
+        );
+        assert_eq!(
+            plan.writes
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/home/mateo/.config/systemd/user/claude-code-sync-autosync.service"),
+                PathBuf::from("/home/mateo/.config/systemd/user/claude-code-sync-autosync.timer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_percent_sign_is_escaped_in_systemd_units() {
+        assert_eq!(systemd_quote(r#"a%b"c\d"#), r#""a%%b\"c\\d""#);
+    }
+
+    #[test]
+    fn without_systemd_a_crontab_line_does_the_same() {
+        let linux = layout(Platform::Linux);
+        assert_eq!(
+            crontab_line(&linux, 10),
+            "*/10 * * * * '/home/mateo/bin/claude code sync' autosync run >> \
+             '/home/mateo/.config/claude-code-sync/autosync.log' 2>&1"
+        );
+        assert!(crontab_line(&linux, 120).starts_with("0 */2 * * * "));
+    }
+
+    #[test]
+    fn the_windows_task_runs_a_hidden_vbs_with_paths_quoted() {
+        let windows = layout(Platform::Windows);
+        let vbs = windows_vbs(&windows);
+        assert!(vbs.contains(
+            "CreateObject(\"WScript.Shell\").Run \"\"\"C:\\Users\\Mateo Bodenlle\\AppData\\Local\\\
+             Programs\\claude-code-sync\\claude-code-sync.exe\"\" autosync run --detach\", 0, False\r\n"
+        ));
+
+        let bytes = utf16le_with_bom(&vbs);
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "a byte-order mark");
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), vbs);
+
+        // `PathBuf::join` uses this platform's separator; on Windows the
+        // path is all backslashes. What is checked here is the quoting.
+        let vbs_path = windows.vbs_path();
+        assert!(vbs_path.starts_with(r"C:\Users\Iñaki\AppData\Roaming\claude-code-sync"));
+        let create = schtasks_create(&windows, 10);
+        assert_eq!(
+            create.args,
+            vec![
+                "schtasks".to_string(),
+                "/Create".to_string(),
+                "/SC".to_string(),
+                "MINUTE".to_string(),
+                "/MO".to_string(),
+                "10".to_string(),
+                "/TN".to_string(),
+                "claude-code-sync autosync".to_string(),
+                "/TR".to_string(),
+                format!("wscript.exe \"{}\"", vbs_path.display()),
+                "/F".to_string(),
+            ]
+        );
+
+        let plan = install_plan(&windows, 10, true, None).unwrap();
+        assert_eq!(plan.writes[0].0, vbs_path);
+        assert_eq!(&plan.writes[0].1[..2], &[0xFF, 0xFE]);
+        let removal = uninstall_plan(&windows, None).unwrap();
+        assert_eq!(
+            removal.commands[0].args,
+            vec![
+                "schtasks",
+                "/Delete",
+                "/TN",
+                "claude-code-sync autosync",
+                "/F"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interval_out_of_range_is_refused() {
+        assert!(install_plan(&layout(Platform::MacOs), 0, true, None).is_err());
+        assert!(install_plan(&layout(Platform::Windows), 1440, true, None).is_err());
+    }
+
+    #[test]
+    fn the_hook_command_is_quoted_for_each_shell() {
+        assert_eq!(
+            hook_command(
+                Platform::Windows,
+                Path::new(r"C:\Users\Mateo Bodenlle\AppData\Local\Programs\claude-code-sync\claude-code-sync.exe")
+            ),
+            "\"C:/Users/Mateo Bodenlle/AppData/Local/Programs/claude-code-sync/claude-code-sync.exe\" \
+             autosync run --detach"
+        );
+        assert_eq!(
+            hook_command(
+                Platform::Linux,
+                Path::new("/home/o'neil/bin/claude-code-sync")
+            ),
+            r"'/home/o'\''neil/bin/claude-code-sync' autosync run --detach"
+        );
+    }
+
+    const EXISTING: &str = r#"{
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Bash(git status)"
+    ]
+  },
+  "cleanupPeriodDays": 30,
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "say bye"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "check.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "zeta": true
+}
+"#;
+
+    fn hook_commands(text: &str) -> Vec<String> {
+        let value: Value = serde_json::from_str(text).unwrap();
+        value["hooks"]["SessionEnd"]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                    .map(|h| h["command"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_install_adds_one_hook_beside_the_others_and_keeps_transcripts() {
+        let ours = "'/x/claude-code-sync' autosync run --detach";
+        let (text, changes) = settings_after_install(Some(EXISTING), Some(ours))
+            .unwrap()
+            .unwrap();
+
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["cleanupPeriodDays"], 3650);
+        assert_eq!(hook_commands(&text), vec!["say bye", ours]);
+        let added = &value["hooks"]["SessionEnd"][1]["hooks"][0];
+        assert_eq!(added["type"], "command");
+        assert_eq!(added["timeout"], HOOK_TIMEOUT_SECONDS);
+        assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(value["model"], "opus");
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(changes[0].contains("cleanupPeriodDays 30 -> 3650"));
+
+        // Members keep their order and untouched ones their exact text.
+        let order: Vec<usize> = [
+            "\"model\"",
+            "\"permissions\"",
+            "\"cleanupPeriodDays\"",
+            "\"hooks\"",
+            "\"zeta\"",
+        ]
+        .iter()
+        .map(|key| text.find(key).unwrap())
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert!(text.starts_with(
+            "{\n  \"model\": \"opus\",\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(git status)\"\n    ]\n  },\n  \"cleanupPeriodDays\": 3650,"
+        ));
+        assert!(text.ends_with("  \"zeta\": true\n}\n"));
+        assert!(!text.starts_with('\u{feff}'));
+
+        // A second install changes nothing; a new binary path replaces ours.
+        assert_eq!(
+            settings_after_install(Some(&text), Some(ours)).unwrap(),
+            None
+        );
+        let moved = "'/y/claude-code-sync' autosync run --detach";
+        let (moved_text, _) = settings_after_install(Some(&text), Some(moved))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook_commands(&moved_text), vec!["say bye", moved]);
+
+        // Uninstall removes ours only and leaves the retention raised.
+        let (after, _) = settings_after_uninstall(Some(&text)).unwrap().unwrap();
+        let value: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(hook_commands(&after), vec!["say bye"]);
+        assert_eq!(value["cleanupPeriodDays"], 3650);
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "check.sh"
+        );
+        assert_eq!(settings_after_uninstall(Some(&after)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_longer_retention_is_left_alone_and_no_hooks_still_raises_a_short_one() {
+        let long = "{\n  \"cleanupPeriodDays\": 5000\n}\n";
+        assert_eq!(settings_after_install(Some(long), None).unwrap(), None);
+
+        let (text, changes) = settings_after_install(Some("{}"), None).unwrap().unwrap();
+        assert_eq!(text, "{\n  \"cleanupPeriodDays\": 3650\n}");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+
+        let (fresh, _) = settings_after_install(None, Some("x autosync run --detach"))
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&fresh).unwrap();
+        assert_eq!(value["cleanupPeriodDays"], 3650);
+        assert_eq!(hook_commands(&fresh), vec!["x autosync run --detach"]);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_dropped_and_no_hooks_removes_ours() {
+        let with_ours = settings_after_install(
+            Some("\u{feff}{\"cleanupPeriodDays\": 3650}"),
+            Some("x autosync run --detach"),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert!(!with_ours.starts_with('\u{feff}'));
+        let (without, changes) = settings_after_install(Some(&with_ours), None)
+            .unwrap()
+            .unwrap();
+        assert!(hook_commands(&without).is_empty());
+        assert!(changes[0].contains("removed"));
+        assert!(!without.contains("\"hooks\""), "{without}");
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_object_is_refused() {
+        assert!(settings_after_install(Some("[1]"), None).is_err());
+        assert!(settings_after_install(Some("{\"hooks\": 3}"), Some("x")).is_err());
+    }
+}

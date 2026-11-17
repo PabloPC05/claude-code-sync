@@ -96,9 +96,14 @@ impl ResolutionResult {
     }
 }
 
+/// Set (to anything but empty) to forbid every prompt, whatever the
+/// terminal: `autosync run` sets it, since nobody is there to answer.
+pub const NONINTERACTIVE_ENV: &str = "CLAUDE_CODE_SYNC_NONINTERACTIVE";
+
 /// Check if we're running in an interactive terminal
 pub fn is_interactive() -> bool {
-    atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+    let forbidden = std::env::var_os(NONINTERACTIVE_ENV).is_some_and(|v| !v.is_empty());
+    !forbidden && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
 }
 
 /// Display detailed conflict information

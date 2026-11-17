@@ -14,7 +14,9 @@ use claude_code_sync::handlers::{
     is_initialized, run_init_from_config, run_onboarding_flow, try_init_from_config,
     validate_older_than,
 };
-use claude_code_sync::{config, filter, logger, report, scm, self_update, sync, VerbosityLevel};
+use claude_code_sync::{
+    autosync, config, filter, logger, report, scm, self_update, sync, sync_lock, VerbosityLevel,
+};
 
 #[derive(Parser)]
 #[command(name = "claude-code-sync")]
@@ -330,6 +332,12 @@ enum Commands {
         action: HistoryAction,
     },
 
+    /// Sync automatically: on a timer, and whenever a Claude Code chat ends
+    Autosync {
+        #[command(subcommand)]
+        action: AutosyncAction,
+    },
+
     /// Update claude-code-sync to the latest release
     SelfUpdate {
         /// Only report whether an update is available
@@ -393,6 +401,43 @@ enum RemoteAction {
         /// Remote name (default: origin)
         #[arg(short, long, default_value = "origin")]
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutosyncAction {
+    /// Install the timer and the SessionEnd hook, and raise Claude Code's
+    /// transcript retention (cleanupPeriodDays) to 3650 days
+    Install {
+        /// Minutes between timer runs
+        #[arg(long, default_value_t = autosync::DEFAULT_INTERVAL_MINUTES)]
+        interval_minutes: u32,
+
+        /// Do not add the SessionEnd hook to ~/.claude/settings.json
+        #[arg(long)]
+        no_hooks: bool,
+
+        /// Print the files and commands without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove the timer and the hook (the retention setting stays)
+    Uninstall {
+        /// Print what would be removed without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show whether the timer and the hook are installed
+    Status,
+
+    /// Run one sync without prompting; quietly does nothing while another
+    /// sync runs (what the timer and the hook run)
+    Run {
+        /// Start the sync in the background and return at once
+        #[arg(long)]
+        detach: bool,
     },
 }
 
@@ -484,10 +529,17 @@ fn main() -> Result<()> {
     let is_init_command = matches!(command, Commands::Init { .. });
     let is_config_command = matches!(command, Commands::Config { .. });
     let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
+    // Autosync runs unattended and must never prompt; installing it needs no repository.
+    let is_autosync_command = matches!(command, Commands::Autosync { .. });
 
     // Run onboarding if needed (but not for Init or Config commands - they handle their own
     // setup - nor SelfUpdate, which never touches the sync repository)
-    if needs_onboarding && !is_init_command && !is_config_command && !is_self_update_command {
+    if needs_onboarding
+        && !is_init_command
+        && !is_config_command
+        && !is_self_update_command
+        && !is_autosync_command
+    {
         log::info!("Running onboarding flow - first time setup detected");
 
         // Try non-interactive init first (from config file)
@@ -500,6 +552,23 @@ fn main() -> Result<()> {
 
         log::info!("Onboarding completed successfully");
     }
+
+    // One run at a time: a sync started by hand waits for an autosync run
+    // (or another terminal) to finish rather than racing it.
+    let _sync_lock = if matches!(
+        command,
+        Commands::Sync { .. }
+            | Commands::Pull { .. }
+            | Commands::Push { .. }
+            | Commands::Purge { .. }
+    ) {
+        Some(sync_lock::SyncLock::acquire_waiting(
+            std::time::Duration::from_secs(600),
+            || eprintln!("Waiting for another claude-code-sync run to finish..."),
+        )?)
+    } else {
+        None
+    };
 
     match command {
         Commands::Init {
@@ -846,6 +915,16 @@ fn main() -> Result<()> {
 
             handle_cleanup_snapshots(dry_run, max_count, max_age_days, interactive, verbosity)?;
         }
+        Commands::Autosync { action } => match action {
+            AutosyncAction::Install {
+                interval_minutes,
+                no_hooks,
+                dry_run,
+            } => autosync::install(interval_minutes, !no_hooks, dry_run)?,
+            AutosyncAction::Uninstall { dry_run } => autosync::uninstall(dry_run)?,
+            AutosyncAction::Status => autosync::status()?,
+            AutosyncAction::Run { detach } => autosync::run(detach)?,
+        },
         Commands::SelfUpdate { check, to, force } => {
             self_update::self_update(check, to.as_deref(), force)?;
         }
