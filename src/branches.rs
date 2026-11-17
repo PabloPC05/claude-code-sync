@@ -258,6 +258,292 @@ pub fn repository_is_ahead(local_path: &Path, local: &[u8], repository: &[u8]) -
     }
 }
 
+/// What a live session's transcript receives when a pull fast-forwards it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Appended {
+    /// The bytes to append: a newline when the local file lacks its final
+    /// one, then every remote entry the local file lacks, in remote order.
+    pub bytes: Vec<u8>,
+    /// The newest message entry the local file had before the append: the
+    /// leaf the window that holds this session in memory is on. `None`
+    /// when nothing in `bytes` is a message, or the local file had none.
+    pub fork_leaf: Option<String>,
+    /// The newest message entry appended.
+    pub remote_tip: Option<String>,
+}
+
+impl Appended {
+    /// The `(fork_leaf, remote_tip)` a window's stale marker records; `None`
+    /// when no message was appended, so no window is out of date.
+    pub fn stale_span(&self) -> Option<(&str, &str)> {
+        Some((self.fork_leaf.as_deref()?, self.remote_tip.as_deref()?))
+    }
+}
+
+/// Whether an entry is a user or assistant message.
+fn is_message_entry(entry: &Entry) -> bool {
+    entry.uuid.is_some() && matches!(entry.kind.as_deref(), Some("user" | "assistant"))
+}
+
+/// What a pull may append to the transcript of a session running here, when
+/// the remote copy only added to the local one: every local entry is in the
+/// remote copy, or the local side added metadata only and the remote added
+/// messages. `None` for anything else (identical, the local side ahead, both
+/// sides added messages, only metadata on both): those stay deferred.
+///
+/// Appending, never rewriting: the live process keeps its own file position
+/// and a rename would orphan it. The entries are the remote's lacking ones
+/// by `uuid` (or exact line when they have none), in the remote file's order.
+pub fn live_fast_forward(local: &[u8], remote: &[u8]) -> Option<Appended> {
+    if local == remote {
+        return None;
+    }
+    let local_entries = entries(local);
+    let remote_entries = entries(remote);
+    let local_keys: HashSet<&EntryKey> = local_entries.iter().map(|e| &e.key).collect();
+    let remote_keys: HashSet<&EntryKey> = remote_entries.iter().map(|e| &e.key).collect();
+    let local_only: Vec<&Entry> = local_entries
+        .iter()
+        .filter(|e| !remote_keys.contains(&e.key))
+        .collect();
+    let mut seen: HashSet<&EntryKey> = HashSet::new();
+    let remote_only: Vec<&Entry> = remote_entries
+        .iter()
+        .filter(|e| !local_keys.contains(&e.key) && seen.insert(&e.key))
+        .collect();
+    if remote_only.is_empty() {
+        return None;
+    }
+    // The local side may have added metadata, never a message.
+    if local_only.iter().any(|e| e.uuid.is_some()) {
+        return None;
+    }
+    // Metadata on both sides is not a fast-forward either way.
+    if !local_only.is_empty() && !remote_only.iter().any(|e| e.uuid.is_some()) {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    if !local.is_empty() && !local.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    for entry in &remote_only {
+        bytes.extend_from_slice(entry.text);
+        bytes.push(b'\n');
+    }
+    let fork_leaf = local_entries
+        .iter()
+        .rev()
+        .find(|e| is_message_entry(e))
+        .and_then(|e| e.uuid.clone());
+    let remote_tip = remote_only
+        .iter()
+        .rev()
+        .find(|e| is_message_entry(e))
+        .and_then(|e| e.uuid.clone());
+    Some(Appended {
+        bytes,
+        fork_leaf,
+        remote_tip,
+    })
+}
+
+/// What closing a stale window did to a transcript, and what it takes to
+/// undo.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Repair {
+    /// Nothing to remove.
+    Unchanged,
+    /// Only noise (what `/exit` appends) hung off the old leaf: the file
+    /// without it.
+    Rewritten(Vec<u8>),
+    /// Real messages hung off the old leaf: they become the session
+    /// `branch_id`, and `main` is the session without them.
+    Split {
+        main: Vec<u8>,
+        branch_id: String,
+        branch: Vec<u8>,
+    },
+}
+
+/// Text a user entry starts with when Claude Code wrote it, not the person.
+const NOISE_PREFIXES: [&str; 4] = [
+    "<command-name>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+];
+
+/// Whether an entry with a uuid is a message a person would miss: any
+/// assistant entry, and any user entry that is not a command wrapper (a
+/// tool result counts as real). Everything else is noise.
+fn is_real_message(entry: &serde_json::Value) -> bool {
+    match entry.get("type").and_then(|t| t.as_str()) {
+        Some("assistant") => true,
+        Some("user") => {
+            if entry.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
+                return false;
+            }
+            let content = entry.get("message").and_then(|m| m.get("content"));
+            let text = match content {
+                Some(serde_json::Value::String(text)) => Some(text.as_str()),
+                Some(serde_json::Value::Array(blocks)) => blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|t| t.as_str()))
+                        .flatten()
+                }),
+                _ => None,
+            };
+            !text.is_some_and(|text| {
+                let text = text.trim_start();
+                NOISE_PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// A transcript line with what repairing reads of it.
+struct RepairLine<'a> {
+    text: &'a [u8],
+    uuid: Option<String>,
+    value: Option<serde_json::Value>,
+}
+
+/// Take a window's leftovers out of a transcript.
+///
+/// A window holding `session_id` was out of date since a pull appended the
+/// other machine's turns after `fork_leaf` (its own leaf) up to `remote_tip`.
+/// What the window wrote after that hangs off `fork_leaf` on a branch of its
+/// own; Claude Code resumes the branch with the newest message, so that
+/// branch must stop being the newest one:
+///
+/// - `kept`: the child of `fork_leaf` on the way to `remote_tip`, and all its
+///   descendants;
+/// - `stale`: every other descendant of `fork_leaf`.
+///
+/// If `stale` holds only noise (the entries `/exit` appends, and anything
+/// that is not a user or assistant message) the file loses it and the
+/// `last-prompt` records naming `fork_leaf` or a stale entry. If it holds a
+/// real message, that branch is moved to a session of its own
+/// (`<title> (rama paralela)`). Branches that do not fork at `fork_leaf`
+/// (Claude Code's own rewinds and edits) are never touched.
+pub fn repair_stale_branch(
+    session_id: &str,
+    bytes: &[u8],
+    fork_leaf: &str,
+    remote_tip: &str,
+) -> Repair {
+    let lines: Vec<RepairLine> = bytes
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|text| {
+            let value = serde_json::from_slice::<serde_json::Value>(text).ok();
+            let uuid = value
+                .as_ref()
+                .and_then(|v| v.get("uuid"))
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string);
+            RepairLine { text, uuid, value }
+        })
+        .collect();
+
+    let mut parents: std::collections::HashMap<&str, Option<&str>> =
+        std::collections::HashMap::new();
+    let mut children: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for line in &lines {
+        let (Some(uuid), Some(value)) = (&line.uuid, &line.value) else {
+            continue;
+        };
+        if parents.contains_key(uuid.as_str()) {
+            continue;
+        }
+        let parent = value
+            .get("parentUuid")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty());
+        parents.insert(uuid, parent);
+        if let Some(parent) = parent {
+            children.entry(parent).or_default().push(uuid);
+        }
+    }
+
+    // The child of the fork on the way to the remote tip.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut current = remote_tip;
+    let first_kept = loop {
+        if !visited.insert(current) {
+            return Repair::Unchanged;
+        }
+        match parents.get(current) {
+            Some(Some(parent)) if *parent == fork_leaf => break current,
+            Some(Some(parent)) => current = parent,
+            _ => return Repair::Unchanged,
+        }
+    };
+
+    let descendants = |root: &str| -> HashSet<&str> {
+        let mut found: HashSet<&str> = HashSet::new();
+        let mut queue: Vec<&str> = children.get(root).cloned().unwrap_or_default();
+        while let Some(next) = queue.pop() {
+            if found.insert(next) {
+                queue.extend(children.get(next).into_iter().flatten().copied());
+            }
+        }
+        found
+    };
+    let mut kept = descendants(first_kept);
+    kept.insert(first_kept);
+    let stale: HashSet<&str> = descendants(fork_leaf)
+        .into_iter()
+        .filter(|uuid| !kept.contains(uuid))
+        .collect();
+    if stale.is_empty() {
+        return Repair::Unchanged;
+    }
+
+    let first_real = lines.iter().find_map(|line| {
+        let uuid = line.uuid.as_deref().filter(|u| stale.contains(u))?;
+        line.value
+            .as_ref()
+            .filter(|v| is_real_message(v))
+            .map(|_| uuid)
+    });
+
+    let names_stale_leaf = |line: &RepairLine| {
+        line.value.as_ref().is_some_and(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("last-prompt")
+                && v.get("leafUuid")
+                    .and_then(|l| l.as_str())
+                    .is_some_and(|leaf| leaf == fork_leaf || stale.contains(leaf))
+        })
+    };
+    let main: Vec<u8> = lines
+        .iter()
+        .filter(|line| {
+            !line.uuid.as_deref().is_some_and(|u| stale.contains(u)) && !names_stale_leaf(line)
+        })
+        .flat_map(|line| line.text.iter().copied())
+        .collect();
+
+    let Some(first_real) = first_real else {
+        return Repair::Rewritten(main);
+    };
+    let branch_id = branch_session_id(session_id, first_real);
+    let without_kept: Vec<u8> = lines
+        .iter()
+        .filter(|line| !line.uuid.as_deref().is_some_and(|u| kept.contains(u)))
+        .flat_map(|line| line.text.iter().copied())
+        .collect();
+    let branch = branch_transcript(session_id, &branch_id, &without_kept);
+    Repair::Split {
+        main,
+        branch_id,
+        branch,
+    }
+}
+
 /// The id of the session a branch of `session_id` becomes: UUIDv5 over the
 /// session and the first new message of the branch.
 pub fn branch_session_id(session_id: &str, first_new_uuid: &str) -> String {
@@ -433,12 +719,12 @@ pub fn owning_session_id(relative: &Path) -> Option<&str> {
     Some(name.strip_suffix(".jsonl").unwrap_or(name))
 }
 
-/// Sessions running on this machine right now: `~/.claude/sessions/*.json`
-/// records whose `pid` is alive. Their transcripts are being written, so a
-/// pull leaves them for a later sync.
-pub fn live_session_ids(claude_home: &Path) -> HashSet<String> {
+/// Sessions running on this machine right now, as `(pid, session id)`:
+/// `~/.claude/sessions/*.json` records whose `pid` is alive. Their
+/// transcripts are being written, so a pull never rewrites them.
+pub fn live_sessions(claude_home: &Path) -> Vec<(u32, String)> {
     let Ok(records) = std::fs::read_dir(claude_home.join("sessions")) else {
-        return HashSet::new();
+        return Vec::new();
     };
     records
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -448,9 +734,29 @@ pub fn live_session_ids(claude_home: &Path) -> HashSet<String> {
         .filter_map(|record| {
             let pid = u32::try_from(record.get("pid")?.as_u64()?).ok()?;
             let session = record.get("sessionId")?.as_str()?.to_string();
-            process_is_alive(pid).then_some(session)
+            process_is_alive(pid).then_some((pid, session))
         })
         .collect()
+}
+
+/// The ids of the sessions running on this machine right now.
+pub fn live_session_ids(claude_home: &Path) -> HashSet<String> {
+    live_sessions(claude_home)
+        .into_iter()
+        .map(|(_, session)| session)
+        .collect()
+}
+
+/// The live processes (Claude Code windows) holding `session_id`, sorted.
+pub fn live_pids_for(claude_home: &Path, session_id: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = live_sessions(claude_home)
+        .into_iter()
+        .filter(|(_, session)| session == session_id)
+        .map(|(pid, _)| pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 /// Whether a process with this id exists. Unknown counts as alive: wrongly
@@ -543,20 +849,68 @@ pub fn write_branch(
     }
 }
 
+/// How many times a write retries on Windows, where an antivirus scan or
+/// an indexer can hold a file open for a moment, and how long it waits.
+const WINDOWS_RETRIES: u32 = 5;
+const WINDOWS_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether an I/O error is a Windows sharing or lock violation.
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    cfg!(windows)
+        && (matches!(error.raw_os_error(), Some(5 | 32 | 33))
+            || error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 /// Write a whole file through a temporary sibling and a rename, so Claude
-/// Code never reads half of it.
+/// Code never reads half of it. On Windows the rename is retried a few
+/// times when the target is momentarily held open.
 pub fn write_file(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("No parent directory for {}", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create {}", parent.display()))?;
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     std::fs::write(temporary.path(), content)?;
-    temporary
-        .persist(path)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    let mut attempt = 0;
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < WINDOWS_RETRIES && is_sharing_violation(&e.error) => {
+                attempt += 1;
+                temporary = e.file;
+                std::thread::sleep(WINDOWS_RETRY_WAIT);
+            }
+            Err(e) => return Err(e).with_context(|| format!("Failed to write {}", path.display())),
+        }
+    }
+}
+
+/// Append `bytes` to an existing file, in one write with the file opened in
+/// append mode: what a live transcript receives, never a rewrite. On
+/// Windows a sharing violation is retried a few times; the error that
+/// remains is the caller's to answer (a pull defers the session).
+pub fn append_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        let result = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(bytes)
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < WINDOWS_RETRIES && is_sharing_violation(&e) => {
+                attempt += 1;
+                std::thread::sleep(WINDOWS_RETRY_WAIT);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to append to {}", path.display()))
+            }
+        }
+    }
 }
 
 /// Copy a session's sidecar directories (`<session>/`: tool results,
@@ -1078,5 +1432,310 @@ mod tests {
         assert!(String::from_utf8_lossy(&a[&name]).contains("B sigue"));
         assert!(!sync(&mut a, &mut repo), "nothing left to do on A");
         assert!(!sync(&mut b, &mut repo), "nothing left to do on B");
+    }
+
+    // --- live fast-forward and the repair of a stale window ----------------
+
+    fn reply(uuid: &str, parent: &str, minute: u32, text: &str) -> String {
+        format!(
+            "{{\"parentUuid\":\"{parent}\",\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}},\"uuid\":\"{uuid}\",\
+             \"timestamp\":\"2026-11-17T10:{minute:02}:00.000Z\",\"sessionId\":\"{S}\"}}\n"
+        )
+    }
+
+    fn tool_result(uuid: &str, parent: &str) -> String {
+        format!(
+            "{{\"parentUuid\":\"{parent}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\
+             \"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}}]}},\
+             \"uuid\":\"{uuid}\",\"sessionId\":\"{S}\"}}\n"
+        )
+    }
+
+    fn noise(uuid: &str, parent: &str, text: &str, meta: bool) -> String {
+        format!(
+            "{{\"parentUuid\":\"{parent}\",\"isMeta\":{meta},\"type\":\"user\",\"message\":{{\"role\":\"user\",\
+             \"content\":\"{text}\"}},\"uuid\":\"{uuid}\",\"sessionId\":\"{S}\"}}\n"
+        )
+    }
+
+    /// The three entries `/exit` appends, off `leaf`.
+    fn exit_noise(leaf: &str) -> Vec<String> {
+        vec![
+            noise("x1", leaf, "<local-command-caveat>Caveat: ...", true),
+            noise("x2", "x1", "<command-name>/exit</command-name>", false),
+            noise(
+                "x3",
+                "x2",
+                "<local-command-stdout>Bye!</local-command-stdout>",
+                false,
+            ),
+            last_prompt(leaf),
+        ]
+    }
+
+    #[test]
+    fn a_remote_that_only_added_is_appended_in_remote_order() {
+        let local = file(&prefix());
+        let remote = with(
+            prefix(),
+            &[
+                message("r1", Some("p2"), 5, "sigue"),
+                reply("r2", "r1", 6, "claro"),
+                last_prompt("r2"),
+            ],
+        );
+        let appended = live_fast_forward(&local, &remote).expect("a fast-forward");
+        let mut grown = local.clone();
+        grown.extend_from_slice(&appended.bytes);
+        assert_eq!(
+            grown, remote,
+            "the local file plus the append is the remote"
+        );
+        assert_eq!(appended.fork_leaf.as_deref(), Some("p2"));
+        assert_eq!(appended.remote_tip.as_deref(), Some("r2"));
+        assert_eq!(appended.stale_span(), Some(("p2", "r2")));
+    }
+
+    #[test]
+    fn the_append_starts_with_the_newline_a_file_lacks() {
+        let mut local = file(&prefix());
+        local.pop();
+        let remote = with(prefix(), &[message("r1", Some("p2"), 5, "sigue")]);
+        let appended = live_fast_forward(&local, &remote).unwrap();
+        assert_eq!(appended.bytes[0], b'\n');
+        let mut grown = local.clone();
+        grown.extend_from_slice(&appended.bytes);
+        assert_eq!(grown, remote);
+    }
+
+    #[test]
+    fn local_metadata_does_not_stop_a_fast_forward_but_a_local_message_does() {
+        let remote = with(
+            prefix(),
+            &[message("r1", Some("p2"), 5, "sigue"), last_prompt("r1")],
+        );
+        let mut with_title = prefix();
+        with_title.push(format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"mi chat\",\"sessionId\":\"{S}\"}}\n"
+        ));
+        let local = file(&with_title);
+        let appended = live_fast_forward(&local, &remote).expect("metadata only locally");
+        assert_eq!(appended.remote_tip.as_deref(), Some("r1"));
+        assert!(!String::from_utf8_lossy(&appended.bytes).contains("mi chat"));
+
+        let diverged = with(prefix(), &[message("l1", Some("p2"), 7, "mio")]);
+        assert_eq!(
+            live_fast_forward(&diverged, &remote),
+            None,
+            "both added messages"
+        );
+        assert_eq!(
+            live_fast_forward(&remote, &local),
+            None,
+            "the local side is ahead"
+        );
+        assert_eq!(live_fast_forward(&local, &local), None, "identical");
+    }
+
+    #[test]
+    fn metadata_on_both_sides_is_not_a_fast_forward() {
+        let title = |t: &str| {
+            format!("{{\"type\":\"custom-title\",\"customTitle\":\"{t}\",\"sessionId\":\"{S}\"}}\n")
+        };
+        let local = with(prefix(), &[title("a")]);
+        let remote = with(prefix(), &[title("b")]);
+        assert_eq!(live_fast_forward(&local, &remote), None);
+    }
+
+    #[test]
+    fn a_metadata_only_addition_appends_without_a_stale_span() {
+        let local = file(&prefix());
+        let remote = with(
+            prefix(),
+            &[format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"nuevo\",\"sessionId\":\"{S}\"}}\n"
+            )],
+        );
+        let appended = live_fast_forward(&local, &remote).unwrap();
+        assert_eq!(
+            appended.stale_span(),
+            None,
+            "no message: no window is behind"
+        );
+        assert!(String::from_utf8_lossy(&appended.bytes).contains("nuevo"));
+    }
+
+    /// A chat both machines share up to `p2`, which the other PC continued to
+    /// `r2`; the old window then closed with `/exit`.
+    fn exited() -> Vec<String> {
+        let mut lines = prefix();
+        lines.extend([
+            message("r1", Some("p2"), 5, "sigue"),
+            reply("r2", "r1", 6, "claro"),
+            last_prompt("r2"),
+        ]);
+        lines.extend(exit_noise("p2"));
+        lines
+    }
+
+    #[test]
+    fn exit_noise_off_the_old_leaf_is_taken_out() {
+        let bytes = file(&exited());
+        let Repair::Rewritten(fixed) = repair_stale_branch(S, &bytes, "p2", "r2") else {
+            panic!("only noise hangs off the old leaf");
+        };
+        let expected = vec![
+            message("p1", None, 0, "hola, revisa el parser"),
+            message("p2", Some("p1"), 1, "y los tests"),
+            message("r1", Some("p2"), 5, "sigue"),
+            reply("r2", "r1", 6, "claro"),
+            last_prompt("r2"),
+        ];
+        assert_eq!(String::from_utf8(fixed).unwrap(), expected.concat());
+    }
+
+    #[test]
+    fn a_real_message_off_the_old_leaf_becomes_a_branch() {
+        let mut lines = prefix();
+        lines.extend([
+            message("r1", Some("p2"), 5, "sigue"),
+            reply("r2", "r1", 6, "claro"),
+            last_prompt("r2"),
+            message("s1", Some("p2"), 9, "desde la ventana vieja"),
+            reply("s2", "s1", 10, "respuesta vieja"),
+            last_prompt("s2"),
+        ]);
+        let bytes = file(&lines);
+        let Repair::Split {
+            main,
+            branch_id,
+            branch,
+        } = repair_stale_branch(S, &bytes, "p2", "r2")
+        else {
+            panic!("a real stale message splits");
+        };
+        assert_eq!(branch_id, branch_session_id(S, "s1"));
+        let main = String::from_utf8(main).unwrap();
+        assert!(main.contains("\"uuid\":\"r2\"") && !main.contains("desde la ventana vieja"));
+        assert!(!main.contains("\"uuid\":\"s2\"") && !main.contains("\"leafUuid\":\"s2\""));
+        let branch = String::from_utf8(branch).unwrap();
+        assert!(branch.contains("desde la ventana vieja") && branch.contains("respuesta vieja"));
+        assert!(
+            branch.contains("\"uuid\":\"p2\""),
+            "the shared history comes along"
+        );
+        assert!(!branch.contains("\"uuid\":\"r1\"") && !branch.contains("\"uuid\":\"r2\""));
+        assert!(!branch.contains(S), "moved to the branch's own session id");
+        assert!(branch.ends_with(&format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"hola, revisa el parser (rama paralela)\",\
+             \"sessionId\":\"{branch_id}\"}}\n"
+        )));
+    }
+
+    #[test]
+    fn a_tool_result_counts_as_a_real_message_and_system_entries_as_noise() {
+        let mut lines = prefix();
+        lines.extend([
+            message("r1", Some("p2"), 5, "sigue"),
+            tool_result("s1", "p2"),
+        ]);
+        assert!(matches!(
+            repair_stale_branch(S, &file(&lines), "p2", "r1"),
+            Repair::Split { .. }
+        ));
+
+        let mut lines = prefix();
+        lines.extend([
+            message("r1", Some("p2"), 5, "sigue"),
+            format!(
+                "{{\"parentUuid\":\"p2\",\"type\":\"system\",\"subtype\":\"x\",\"uuid\":\"s1\",\"sessionId\":\"{S}\"}}\n"
+            ),
+        ]);
+        assert!(matches!(
+            repair_stale_branch(S, &file(&lines), "p2", "r1"),
+            Repair::Rewritten(_)
+        ));
+    }
+
+    #[test]
+    fn branches_that_do_not_fork_at_the_old_leaf_are_never_touched() {
+        // A rewind: a second child of p1, with its own continuation.
+        let mut lines = prefix();
+        lines.extend([
+            message("w1", Some("p1"), 3, "otra pregunta (rewind)"),
+            reply("w2", "w1", 4, "otra respuesta"),
+            message("r1", Some("p2"), 5, "sigue"),
+            reply("r2", "r1", 6, "claro"),
+        ]);
+        lines.extend(exit_noise("p2"));
+        let bytes = file(&lines);
+        let Repair::Rewritten(fixed) = repair_stale_branch(S, &bytes, "p2", "r2") else {
+            panic!("the noise goes");
+        };
+        let fixed = String::from_utf8(fixed).unwrap();
+        for kept in ["w1", "w2", "r1", "r2", "p1", "p2"] {
+            assert!(fixed.contains(&format!("\"uuid\":\"{kept}\"")), "{kept}");
+        }
+        assert!(!fixed.contains("\"uuid\":\"x1\""));
+
+        // Nothing hangs off the leaf: nothing to do.
+        let clean = file(&[prefix(), vec![message("r1", Some("p2"), 5, "sigue")]].concat());
+        assert_eq!(
+            repair_stale_branch(S, &clean, "p2", "r1"),
+            Repair::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_tip_that_does_not_descend_from_the_leaf_changes_nothing() {
+        let bytes = file(&exited());
+        assert_eq!(
+            repair_stale_branch(S, &bytes, "p2", "nope"),
+            Repair::Unchanged
+        );
+        assert_eq!(
+            repair_stale_branch(S, &bytes, "p2", "p2"),
+            Repair::Unchanged
+        );
+        assert_eq!(
+            repair_stale_branch(S, &bytes, "x1", "r2"),
+            Repair::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_lone_last_prompt_is_left_alone_when_nothing_was_appended() {
+        // An abrupt close: only last-prompt and cost-state.
+        let mut lines = prefix();
+        lines.extend([message("r1", Some("p2"), 5, "sigue"), last_prompt("p2")]);
+        assert_eq!(
+            repair_stale_branch(S, &file(&lines), "p2", "r1"),
+            Repair::Unchanged
+        );
+    }
+
+    #[test]
+    fn the_repaired_file_ends_on_the_remote_branch() {
+        // After the repair, the newest message entry is the remote tip again.
+        let Repair::Rewritten(fixed) = repair_stale_branch(S, &file(&exited()), "p2", "r2") else {
+            panic!();
+        };
+        let last_message = entries(&fixed)
+            .into_iter()
+            .rev()
+            .find(|e| is_message_entry(e))
+            .and_then(|e| e.uuid);
+        assert_eq!(last_message.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn append_file_adds_to_the_end_and_write_file_replaces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.jsonl");
+        write_file(&path, b"uno\n").unwrap();
+        append_file(&path, b"dos\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"uno\ndos\n");
+        assert!(append_file(&dir.path().join("missing.jsonl"), b"x").is_err());
     }
 }
