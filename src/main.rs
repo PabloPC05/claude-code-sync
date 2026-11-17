@@ -25,6 +25,8 @@ struct Cli {
     command: Option<Commands>,
 }
 
+// Parsed once per run: boxing the biggest variant (`Config`) would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new sync repository
@@ -236,6 +238,20 @@ enum Commands {
         /// Remove a project mapping by id (repeatable)
         #[arg(long, value_name = "ID")]
         unmap_project: Vec<String>,
+
+        /// Map a folder of projects to this machine's path, as id=/absolute/path
+        /// (repeatable; a Windows path may use \ or /). Every project below it
+        /// syncs as @<id>@<path below the folder>, new projects included.
+        #[arg(long, value_name = "ID=PATH")]
+        map_root: Vec<String>,
+
+        /// Remove a root mapping by id (repeatable)
+        #[arg(long, value_name = "ID")]
+        unmap_root: Vec<String>,
+
+        /// Treat the home directory as the implicit root `home` (default: true)
+        #[arg(long, value_name = "BOOL")]
+        auto_home_root: Option<bool>,
 
         /// Warn once per file a pull cannot place, instead of one combined
         /// warning naming every project with no local match
@@ -666,6 +682,9 @@ fn main() -> Result<()> {
             disable_artifacts,
             map_project,
             unmap_project,
+            map_root,
+            unmap_root,
+            auto_home_root,
             warn_each_skipped_file,
             merge_tool,
             prefer_merge_tool,
@@ -692,6 +711,9 @@ fn main() -> Result<()> {
             let has_any_flag = has_filter_flag
                 || !map_project.is_empty()
                 || !unmap_project.is_empty()
+                || !map_root.is_empty()
+                || !unmap_root.is_empty()
+                || auto_home_root.is_some()
                 || warn_each_skipped_file.is_some()
                 || merge_tool.is_some()
                 || prefer_merge_tool.is_some()
@@ -718,6 +740,12 @@ fn main() -> Result<()> {
                 // invocation does not silently drop all but the first.
                 if !map_project.is_empty() || !unmap_project.is_empty() {
                     filter::update_project_map(&map_project, &unmap_project)?;
+                }
+                if !map_root.is_empty() || !unmap_root.is_empty() {
+                    filter::update_root_map(&map_root, &unmap_root)?;
+                }
+                if let Some(enabled) = auto_home_root {
+                    filter::set_auto_home_root(enabled)?;
                 }
                 if let Some(each_file) = warn_each_skipped_file {
                     filter::set_warn_each_skipped_file(each_file)?;

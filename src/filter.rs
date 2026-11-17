@@ -68,6 +68,17 @@ pub struct FilterConfig {
     #[serde(default)]
     pub project_map: crate::project_map::ProjectMap,
 
+    /// Root id -> this machine's absolute path for a folder of projects.
+    /// Every project below a root syncs as `@<id>@<path below the root>`,
+    /// so new projects there need no mapping of their own.
+    #[serde(default)]
+    pub root_map: crate::project_map::RootMap,
+
+    /// Treat this machine's home directory as the root `home`, unless
+    /// `root_map` maps `home` itself.
+    #[serde(default = "default_auto_home_root")]
+    pub auto_home_root: bool,
+
     /// Delete transcripts older than this many days from both the machine and
     /// the sync repository. Unset means the default window: the longer of six
     /// months and this machine's own Claude Code retention.
@@ -113,6 +124,10 @@ fn default_sync_subdirectory() -> String {
     "projects".to_string()
 }
 
+fn default_auto_home_root() -> bool {
+    true
+}
+
 impl Default for FilterConfig {
     fn default() -> Self {
         FilterConfig {
@@ -128,6 +143,8 @@ impl Default for FilterConfig {
             use_project_name_only: false,
             sync_artifacts: Default::default(),
             project_map: Default::default(),
+            root_map: Default::default(),
+            auto_home_root: default_auto_home_root(),
             purge_older_than_days: None,
             purge_after_sync: false,
             warn_each_skipped_file: false,
@@ -315,6 +332,7 @@ impl FilterConfig {
             );
         }
         crate::project_map::validate(&self.project_map)?;
+        crate::project_map::validate_roots(&self.root_map)?;
         Ok(())
     }
 }
@@ -379,6 +397,63 @@ pub fn update_project_map(add: &[String], remove: &[String]) -> Result<()> {
         println!("  {} -> {}", id.cyan(), path.display());
     }
     Ok(())
+}
+
+/// Add or remove `[root_map]` entries. `add` holds `id=/absolute/path`
+/// pairs (a Windows path may use either separator); `remove` holds ids.
+pub fn update_root_map(add: &[String], remove: &[String]) -> Result<()> {
+    let mut config = FilterConfig::load()?;
+
+    for entry in add {
+        let Some((id, path)) = entry.split_once('=') else {
+            bail!("expected id=/absolute/path, got {entry:?}");
+        };
+        let path = crate::project_map::normalize_project_path(Path::new(path.trim()));
+        config.root_map.insert(id.trim().to_string(), path);
+    }
+    for id in remove {
+        if config.root_map.remove(id.trim()).is_none() {
+            println!("{}", format!("No root named {id:?}").yellow());
+        }
+    }
+
+    config.validate()?;
+    config.save()?;
+
+    print_root_map(&config);
+    Ok(())
+}
+
+/// Turn the implicit `home` root on or off.
+pub fn set_auto_home_root(enabled: bool) -> Result<()> {
+    let mut config = FilterConfig::load()?;
+    config.auto_home_root = enabled;
+    config.validate()?;
+    config.save()?;
+
+    print_root_map(&config);
+    Ok(())
+}
+
+/// The roots this machine resolves, the implicit `home` marked as such.
+fn print_root_map(config: &FilterConfig) {
+    println!("{}", "Root map:".green());
+    let roots = crate::project_map::effective_roots(config);
+    if roots.is_empty() {
+        println!(
+            "  {}",
+            "empty (projects sync under the project map or their encoded path)".yellow()
+        );
+    }
+    for (id, path) in &roots {
+        let implicit = id == crate::project_map::HOME_ROOT_ID && !config.root_map.contains_key(id);
+        let note = if implicit {
+            " (implicit: auto_home_root)"
+        } else {
+            ""
+        };
+        println!("  {} -> {}{}", id.cyan(), path.display(), note.dimmed());
+    }
 }
 
 /// Set the retention window and whether a sync purges.
@@ -780,6 +855,26 @@ pub fn show_config() -> Result<()> {
     }
     for (id, path) in &config.project_map {
         println!("    {} -> {}", id.cyan(), path.display());
+    }
+
+    println!(
+        "  {}: {}",
+        "Implicit home root".cyan(),
+        if config.auto_home_root {
+            "Yes (projects under the home directory sync as @home@...)".green()
+        } else {
+            "No".yellow()
+        }
+    );
+    println!("  {}:", "Root map".cyan());
+    let roots = crate::project_map::effective_roots(&config);
+    if roots.is_empty() {
+        println!("    {}", "empty".yellow());
+    }
+    for (id, path) in &roots {
+        let implicit = id == crate::project_map::HOME_ROOT_ID && !config.root_map.contains_key(id);
+        let note = if implicit { " (implicit)" } else { "" };
+        println!("    {} -> {}{}", id.cyan(), path.display(), note.dimmed());
     }
 
     println!("  {}:", "Artifact sync".cyan());

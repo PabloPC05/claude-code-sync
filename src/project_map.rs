@@ -2,19 +2,37 @@
 //! machine, so one project syncs under one name when home directories, user
 //! names or checkout paths differ.
 //!
-//! Resolution order in both directions: the map, then `use_project_name_only`,
-//! then the encoded directory name. The map comes first because it survives a
-//! rename and stays unambiguous when two checkouts share a folder name.
+//! Beside it, a root map: `id -> absolute folder`, also per machine. Every
+//! project under a mapped folder syncs as `@<id>@<path below the folder>`, so
+//! a whole tree of projects — new ones included — needs no setup at all. The
+//! machine's home directory is the implicit root `home`.
+//!
+//! Resolution order in both directions: the project map, then the root map
+//! (longest matching root), then `use_project_name_only`, then the encoded
+//! directory name. The project map comes first because it survives a rename
+//! and stays unambiguous when two checkouts share a folder name.
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::filter::FilterConfig;
 use crate::sync::discovery::{extract_project_name, find_local_project_by_name};
 
 /// Canonical id -> absolute project path, as configured per machine.
 pub type ProjectMap = BTreeMap<String, PathBuf>;
+
+/// Root id -> absolute folder, as configured per machine. A project below a
+/// root syncs under `@<id>@<path relative to the root>`.
+pub type RootMap = BTreeMap<String, PathBuf>;
+
+/// The implicit root: this machine's home directory, unless
+/// `auto_home_root` is off or `home` is mapped explicitly.
+pub const HOME_ROOT_ID: &str = "home";
+
+/// Opens and closes the root id in a repo directory name: `@<id>@<rel>`.
+const ROOT_MARKER: char = '@';
 
 /// The longest directory name Claude Code writes before it shortens one.
 const MAX_ENCODED_LENGTH: usize = 200;
@@ -132,7 +150,284 @@ pub fn canonical_id(map: &ProjectMap, encoded_dir: &str) -> Option<String> {
         .map(|(id, _)| id.clone())
 }
 
-/// The directory name a local encoded project directory takes in the sync repo.
+/// Characters a root id may not contain: it becomes part of one directory
+/// name on every operating system, and `@` delimits it.
+const FORBIDDEN_ROOT_ID_CHARS: &[char] = &['/', '\\', '@', '%', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Reject a root map that cannot be applied: an id that is not a plain name,
+/// or a folder that is not an absolute path.
+pub fn validate_roots(roots: &RootMap) -> Result<()> {
+    for (id, path) in roots {
+        let plain = !id.is_empty()
+            && id != "."
+            && id != ".."
+            && !id.chars().any(|c| {
+                FORBIDDEN_ROOT_ID_CHARS.contains(&c) || c.is_whitespace() || c.is_control()
+            });
+        if !plain {
+            bail!(
+                "root_map id {id:?} must be a plain name (no spaces, path separators or any of {})",
+                FORBIDDEN_ROOT_ID_CHARS.iter().collect::<String>()
+            );
+        }
+        if !path.is_absolute() {
+            bail!(
+                "root_map entry {id:?} must be an absolute path, got {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The roots this machine resolves: the configured ones, plus `home` for the
+/// home directory unless it is mapped explicitly or `auto_home_root` is off.
+pub fn effective_roots(filter: &FilterConfig) -> RootMap {
+    let mut roots = filter.root_map.clone();
+    if filter.auto_home_root && !roots.contains_key(HOME_ROOT_ID) {
+        if let Some(home) = crate::sync::discovery::machine_home_dir() {
+            roots.insert(HOME_ROOT_ID.to_string(), home);
+        }
+    }
+    roots
+}
+
+/// Whether a path is spelled the Windows way: a drive letter (`C:\`, `c:/`)
+/// or a UNC share (`\\\\server\\share`). Decided from the text, so a Windows
+/// path is handled the same on every platform.
+pub fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    drive || path.starts_with(r"\\")
+}
+
+/// A path's components, ignoring repeated and trailing separators. Windows
+/// paths split on both separators; elsewhere a backslash is an ordinary
+/// character of a file name.
+fn path_components(path: &str, windows: bool) -> Vec<&str> {
+    path.split(|c| c == '/' || (windows && c == '\\'))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// Whether two path components name the same folder: case-insensitively on
+/// Windows (`c:` and `C:` included), exactly elsewhere.
+fn same_component(a: &str, b: &str, windows: bool) -> bool {
+    if windows {
+        a == b || a.to_lowercase() == b.to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// `path` relative to `root`, components joined with `/`, or `None` when the
+/// path is not inside the root. The root itself is `Some("")`.
+pub fn relative_to_root(root: &str, path: &str) -> Option<String> {
+    let windows = is_windows_path(root);
+    if is_windows_path(path) != windows {
+        return None;
+    }
+    if !windows && !(root.starts_with('/') && path.starts_with('/')) {
+        return None;
+    }
+    let root_parts = path_components(root, windows);
+    let path_parts = path_components(path, windows);
+    if path_parts.len() < root_parts.len() {
+        return None;
+    }
+    let inside = root_parts
+        .iter()
+        .zip(&path_parts)
+        .all(|(a, b)| same_component(a, b, windows));
+    inside.then(|| path_parts[root_parts.len()..].join("/"))
+}
+
+/// The repo directory name of a project at `path` under the longest root
+/// that contains it, or `None` when no root does.
+pub fn root_repo_dir_name(roots: &RootMap, path: &str) -> Option<String> {
+    let mut best: Option<(usize, &str, String)> = None;
+    for (id, root) in roots {
+        let root = root.to_string_lossy();
+        let Some(relative) = relative_to_root(&root, path) else {
+            continue;
+        };
+        let depth = path_components(&root, is_windows_path(&root)).len();
+        if best
+            .as_ref()
+            .is_none_or(|(best_depth, _, _)| depth > *best_depth)
+        {
+            best = Some((depth, id, relative));
+        }
+    }
+    best.map(|(_, id, relative)| root_dir_name(id, &relative))
+}
+
+/// `@<id>@<escaped relative path>`: one directory name, valid on every OS.
+pub fn root_dir_name(id: &str, relative: &str) -> String {
+    format!(
+        "{ROOT_MARKER}{id}{ROOT_MARKER}{}",
+        escape_relative_path(relative)
+    )
+}
+
+/// Split a repo directory name written by [`root_dir_name`] into its root id
+/// and its relative path (`/`-separated), or `None` for any other name.
+pub fn parse_root_dir_name(name: &str) -> Option<(&str, String)> {
+    let rest = name.strip_prefix(ROOT_MARKER)?;
+    let (id, escaped) = rest.split_once(ROOT_MARKER)?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((id, unescape_relative_path(escaped)?))
+}
+
+/// Characters a directory name cannot hold on some OS, written as `%XX`:
+/// `%` itself, both separators, and what Windows forbids in a name.
+const ESCAPED_CHARS: &[char] = &['%', '/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Escape a `/`-separated relative path into one portable path component.
+/// A trailing dot or space is escaped too: Windows drops it from a name.
+pub fn escape_relative_path(relative: &str) -> String {
+    let mut escaped = String::with_capacity(relative.len());
+    let last = relative.chars().count().saturating_sub(1);
+    for (index, c) in relative.chars().enumerate() {
+        let trailing_dot_or_space = index == last && (c == '.' || c == ' ');
+        if ESCAPED_CHARS.contains(&c) || c.is_ascii_control() || trailing_dot_or_space {
+            escaped.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
+/// Undo [`escape_relative_path`]. `None` for a malformed escape.
+pub fn unescape_relative_path(escaped: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(escaped.len());
+    let mut rest = escaped.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The absolute path of `relative` (`/`-separated) under `root`, joined with
+/// the root's own separator and spelled as the root is configured. `None`
+/// when the relative path would climb out of the root.
+pub fn root_project_path(root: &str, relative: &str) -> Option<String> {
+    let windows = is_windows_path(root);
+    let separator = if windows { "\\" } else { "/" };
+    let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.iter().any(|part| *part == "." || *part == "..") {
+        return None;
+    }
+    if parts.is_empty() {
+        return Some(root.to_string());
+    }
+    // `/` and `C:\` keep their separator: trimming leaves "" and "C:".
+    let base = root.trim_end_matches(|c| c == '/' || (windows && c == '\\'));
+    Some(format!("{base}{separator}{}", parts.join(separator)))
+}
+
+/// The repo directory name a local encoded project directory takes from the
+/// project map or the root map, or `None` when neither places it.
+pub fn mapped_repo_dir_name(
+    filter: &FilterConfig,
+    projects_dir: &Path,
+    encoded_dir: &str,
+) -> Option<String> {
+    if let Some(id) = canonical_id(&filter.project_map, encoded_dir) {
+        return Some(id);
+    }
+    let roots = effective_roots(filter);
+    if roots.is_empty() {
+        return None;
+    }
+    let path = project_path_from_transcripts(&projects_dir.join(encoded_dir), encoded_dir)?;
+    root_repo_dir_name(&roots, &path)
+}
+
+/// The project folder an encoded directory stands for: a `cwd` one of its
+/// transcripts records that encodes back to the directory's name. A session
+/// that changed directory records other `cwd`s as well; those are skipped.
+///
+/// Answers are remembered for the life of the process, since discovery asks
+/// once per file in a directory: a found path for good (a directory's name
+/// pins its path), a miss until the directory's transcripts change.
+pub fn project_path_from_transcripts(project_dir: &Path, encoded_dir: &str) -> Option<String> {
+    use std::io::BufRead;
+
+    type Lookup = BTreeMap<PathBuf, Result<String, (usize, u64)>>;
+    static LOOKUPS: OnceLock<Mutex<Lookup>> = OnceLock::new();
+    let lookups = LOOKUPS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let remembered = lookups.lock().ok()?.get(project_dir).cloned();
+    if let Some(Ok(path)) = &remembered {
+        return Some(path.clone());
+    }
+
+    let mut transcripts: Vec<(PathBuf, u64)> = std::fs::read_dir(project_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            metadata.is_file().then(|| (e.path(), metadata.len()))
+        })
+        .collect();
+    transcripts.sort();
+    let fingerprint = (
+        transcripts.len(),
+        transcripts.iter().map(|(_, len)| len).sum::<u64>(),
+    );
+    if remembered == Some(Err(fingerprint)) {
+        return None;
+    }
+
+    let mut rejected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut found = None;
+    'transcripts: for (transcript, _) in &transcripts {
+        let Ok(file) = std::fs::File::open(transcript) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines().map_while(|l| l.ok()) {
+            // Most lines are not worth parsing for this.
+            if !line.contains("\"cwd\"") {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(cwd) = entry.get("cwd").and_then(|cwd| cwd.as_str()) else {
+                continue;
+            };
+            if rejected.contains(cwd) {
+                continue;
+            }
+            if encode_path_str(cwd) == encoded_dir {
+                found = Some(cwd.to_string());
+                break 'transcripts;
+            }
+            rejected.insert(cwd.to_string());
+        }
+    }
+
+    if let Ok(mut lookups) = lookups.lock() {
+        let answer = found.clone().ok_or(fingerprint);
+        lookups.insert(project_dir.to_path_buf(), answer);
+    }
+    found
+}
+
+/// The directory name a local encoded project directory takes in the sync
+/// repo, from its name alone. The root map needs the project's real path,
+/// which only its transcripts know: [`repo_dir_name_in`] consults it.
 pub fn repo_dir_name(filter: &FilterConfig, encoded_dir: &str) -> String {
     if let Some(id) = canonical_id(&filter.project_map, encoded_dir) {
         return id;
@@ -143,14 +438,21 @@ pub fn repo_dir_name(filter: &FilterConfig, encoded_dir: &str) -> String {
     encoded_dir.to_string()
 }
 
-/// [`repo_dir_name`] for a project directory under `projects_dir`. In
-/// `use_project_name_only` mode the name comes from the working directory a
-/// transcript in it records, the same name its sessions are pushed under:
+/// The directory name a project directory under `projects_dir` takes in the
+/// sync repo: the project map, then the root map, then the name-only and
+/// encoded fallbacks. Sessions, their sidecar directories and every
+/// attachment of the project go through here, so they share one name.
+///
+/// In `use_project_name_only` mode the name comes from the working directory
+/// a transcript in it records, the same name its sessions are pushed under:
 /// the encoded directory alone cannot tell `shop-web` from `shop/web`, and
 /// its last dash-separated piece would file this project's memory and
 /// attachments apart from its sessions.
 pub fn repo_dir_name_in(filter: &FilterConfig, projects_dir: &Path, encoded_dir: &str) -> String {
-    if filter.use_project_name_only && canonical_id(&filter.project_map, encoded_dir).is_none() {
+    if let Some(name) = mapped_repo_dir_name(filter, projects_dir, encoded_dir) {
+        return name;
+    }
+    if filter.use_project_name_only {
         if let Some(name) = project_name_from_transcripts(&projects_dir.join(encoded_dir)) {
             return name;
         }
@@ -201,6 +503,13 @@ pub fn local_project_dir(
     if let Some(path) = filter.project_map.get(repo_dir_name) {
         return Some(projects_dir.join(encode_project_path(path)));
     }
+    if let Some((root_id, relative)) = parse_root_dir_name(repo_dir_name) {
+        // Another machine's root: placed only if this machine maps it too.
+        let roots = effective_roots(filter);
+        let root = roots.get(root_id)?;
+        let path = root_project_path(&root.to_string_lossy(), &relative)?;
+        return Some(projects_dir.join(encode_path_str(&path)));
+    }
     if filter.use_project_name_only {
         return find_local_project_by_name(projects_dir, repo_dir_name);
     }
@@ -245,6 +554,28 @@ pub fn merge_skipped(into: &mut SkippedByProject, more: &SkippedByProject) {
 /// What to do about a project this machine cannot place, in both warning modes.
 const MAPPING_REMEDY: &str = "Map each one: claude-code-sync config --map-project <id>=<path>.";
 
+/// The remedy for the misses: map the project, or for a project another
+/// machine filed under a root, map that root here.
+fn mapping_remedy(skipped: &SkippedByProject) -> String {
+    let mut roots: Vec<&str> = skipped
+        .keys()
+        .filter_map(|project| parse_root_dir_name(project).map(|(id, _)| id))
+        .collect();
+    roots.dedup();
+    let has_projects = skipped.keys().any(|p| parse_root_dir_name(p).is_none());
+    let root_remedy = (!roots.is_empty()).then(|| {
+        format!(
+            "Map each root ({}): claude-code-sync config --map-root <root>=<path>.",
+            roots.join(", ")
+        )
+    });
+    match (has_projects, root_remedy) {
+        (true, Some(root_remedy)) => format!("{MAPPING_REMEDY} {root_remedy}"),
+        (false, Some(root_remedy)) => root_remedy,
+        (_, None) => MAPPING_REMEDY.to_string(),
+    }
+}
+
 /// The warning lines for files no local project claims: one line naming every
 /// project by default, one line per file when `each_file` is set.
 ///
@@ -267,7 +598,7 @@ pub fn skipped_project_warnings(skipped: &SkippedByProject, each_file: bool) -> 
                 })
             })
             .collect();
-        lines.push(MAPPING_REMEDY.to_string());
+        lines.push(mapping_remedy(skipped));
         return lines;
     }
 
@@ -278,9 +609,10 @@ pub fn skipped_project_warnings(skipped: &SkippedByProject, each_file: bool) -> 
         .collect();
 
     vec![format!(
-        "Skipped {total_files} file(s) with no local project: {}. {MAPPING_REMEDY} \
+        "Skipped {total_files} file(s) with no local project: {}. {} \
          A line per file: config --warn-each-skipped-file true.",
-        project_list.join(", ")
+        project_list.join(", "),
+        mapping_remedy(skipped)
     )]
 }
 
@@ -578,6 +910,347 @@ mod tests {
 
         assert!(skipped_project_warnings(&nothing, false).is_empty());
         assert!(skipped_project_warnings(&nothing, true).is_empty());
+    }
+
+    fn rooted(entries: &[(&str, &str)]) -> FilterConfig {
+        FilterConfig {
+            root_map: entries
+                .iter()
+                .map(|(id, path)| ((*id).to_string(), PathBuf::from(path)))
+                .collect(),
+            auto_home_root: false,
+            ..Default::default()
+        }
+    }
+
+    fn roots(entries: &[(&str, &str)]) -> RootMap {
+        rooted(entries).root_map
+    }
+
+    /// Where machine `to` files the project that machine `from` keeps at
+    /// `path`: the repo name `from` pushes, resolved by `to`.
+    fn carried(from: &RootMap, path: &str, to: &RootMap) -> Option<String> {
+        let repo_name = root_repo_dir_name(from, path)?;
+        let (id, relative) = parse_root_dir_name(&repo_name)?;
+        let root = to.get(id)?;
+        root_project_path(&root.to_string_lossy(), &relative).map(|p| encode_path_str(&p))
+    }
+
+    #[test]
+    fn a_mac_project_lands_in_the_windows_encoded_directory_and_back() {
+        let mac = roots(&[("proyectos", "/Users/mateo/proyectos")]);
+        let windows = roots(&[("proyectos", r"C:\Users\Mateo\proyectos")]);
+
+        assert_eq!(
+            root_repo_dir_name(&mac, "/Users/mateo/proyectos/jarvis").as_deref(),
+            Some("@proyectos@jarvis")
+        );
+        assert_eq!(
+            carried(&mac, "/Users/mateo/proyectos/jarvis", &windows).as_deref(),
+            Some("C--Users-Mateo-proyectos-jarvis")
+        );
+        assert_eq!(
+            carried(&windows, r"C:\Users\Mateo\proyectos\jarvis", &mac).as_deref(),
+            Some("-Users-mateo-proyectos-jarvis")
+        );
+    }
+
+    #[test]
+    fn a_nested_windows_project_lands_on_linux_and_back() {
+        let windows = roots(&[("proyectos", r"C:\Users\Mateo\proyectos")]);
+        let linux = roots(&[("proyectos", "/home/mateo/proyectos")]);
+        let path = r"C:\Users\Mateo\proyectos\clientes\acme\web";
+
+        assert_eq!(
+            root_repo_dir_name(&windows, path).as_deref(),
+            Some("@proyectos@clientes%2Facme%2Fweb")
+        );
+        assert_eq!(
+            carried(&windows, path, &linux).as_deref(),
+            Some("-home-mateo-proyectos-clientes-acme-web")
+        );
+        assert_eq!(
+            carried(&linux, "/home/mateo/proyectos/clientes/acme/web", &windows).as_deref(),
+            Some("C--Users-Mateo-proyectos-clientes-acme-web")
+        );
+    }
+
+    #[test]
+    fn a_linux_project_lands_on_a_mac_and_back() {
+        let linux = roots(&[("code", "/home/mateo/code")]);
+        let mac = roots(&[("code", "/Users/mateo/Developer")]);
+
+        assert_eq!(
+            carried(&linux, "/home/mateo/code/api", &mac).as_deref(),
+            Some("-Users-mateo-Developer-api")
+        );
+        assert_eq!(
+            carried(&mac, "/Users/mateo/Developer/api", &linux).as_deref(),
+            Some("-home-mateo-code-api")
+        );
+    }
+
+    #[test]
+    fn different_profile_names_and_a_onedrive_documents_folder_meet_in_one_name() {
+        let first = roots(&[("proyectos", r"C:\Users\Mateo\Documents\proyectos")]);
+        let second = roots(&[(
+            "proyectos",
+            r"C:\Users\mateo.bodenlle\OneDrive\Documentos\proyectos",
+        )]);
+
+        assert_eq!(
+            carried(
+                &first,
+                r"C:\Users\Mateo\Documents\proyectos\jarvis",
+                &second
+            )
+            .as_deref(),
+            Some("C--Users-mateo-bodenlle-OneDrive-Documentos-proyectos-jarvis")
+        );
+    }
+
+    #[test]
+    fn the_longest_matching_root_wins() {
+        let both = roots(&[
+            ("home", "/home/mateo"),
+            ("proyectos", "/home/mateo/proyectos"),
+        ]);
+
+        assert_eq!(
+            root_repo_dir_name(&both, "/home/mateo/proyectos/jarvis").as_deref(),
+            Some("@proyectos@jarvis")
+        );
+        assert_eq!(
+            root_repo_dir_name(&both, "/home/mateo/otros/notas").as_deref(),
+            Some("@home@otros%2Fnotas")
+        );
+        assert_eq!(root_repo_dir_name(&both, "/srv/app"), None);
+    }
+
+    #[test]
+    fn a_root_matches_whole_folders_only() {
+        let short = roots(&[("p", "/home/mateo/proy")]);
+        assert_eq!(root_repo_dir_name(&short, "/home/mateo/proyectos/x"), None);
+    }
+
+    #[test]
+    fn windows_roots_match_case_insensitively_drive_letter_included() {
+        let windows = roots(&[("proyectos", r"C:\Users\Mateo\Proyectos")]);
+
+        assert_eq!(
+            root_repo_dir_name(&windows, r"c:\users\mateo\proyectos\Jarvis").as_deref(),
+            Some("@proyectos@Jarvis"),
+            "the relative part keeps the project's own spelling"
+        );
+        assert_eq!(
+            root_repo_dir_name(&windows, "C:/Users/MATEO/Proyectos/jarvis").as_deref(),
+            Some("@proyectos@jarvis"),
+            "forward slashes are separators on Windows too"
+        );
+
+        let unix = roots(&[("proyectos", "/Users/Mateo/Proyectos")]);
+        assert_eq!(
+            root_repo_dir_name(&unix, "/users/mateo/proyectos/jarvis"),
+            None,
+            "Unix paths stay case-sensitive"
+        );
+    }
+
+    #[test]
+    fn a_windows_project_materializes_with_the_configured_root_spelling() {
+        let configured = rooted(&[("proyectos", "C:/Users/Mateo/proyectos")]);
+        let projects = PathBuf::from("/claude/projects");
+
+        assert_eq!(
+            local_project_dir(&configured, &projects, "@proyectos@jarvis"),
+            Some(projects.join("C--Users-Mateo-proyectos-jarvis"))
+        );
+        assert_eq!(
+            root_project_path(r"C:\Users\Mateo\proyectos", "a/b").as_deref(),
+            Some(r"C:\Users\Mateo\proyectos\a\b")
+        );
+        assert_eq!(root_project_path("C:\\", "a").as_deref(), Some(r"C:\a"));
+        assert_eq!(root_project_path("/", "a").as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn the_root_itself_is_a_project_too() {
+        let linux = roots(&[("proyectos", "/home/mateo/proyectos")]);
+        let windows = rooted(&[("proyectos", r"C:\Users\Mateo\proyectos")]);
+
+        assert_eq!(
+            root_repo_dir_name(&linux, "/home/mateo/proyectos").as_deref(),
+            Some("@proyectos@")
+        );
+        assert_eq!(
+            local_project_dir(&windows, Path::new("/p"), "@proyectos@"),
+            Some(Path::new("/p").join("C--Users-Mateo-proyectos"))
+        );
+    }
+
+    #[test]
+    fn escaping_round_trips_and_yields_one_portable_component() {
+        for relative in [
+            "plain",
+            "a/b/c",
+            "100%/done",
+            r#"we\ird:name*?"<>|"#,
+            "trailing.",
+            "trailing ",
+            "Proyecto_\u{d1}and\u{fa}.v2/espa\u{f1}ol",
+            "",
+        ] {
+            let escaped = escape_relative_path(relative);
+            let invalid = &ESCAPED_CHARS[1..];
+            assert!(
+                !escaped.contains(invalid),
+                "{escaped:?} must be one valid component on every OS"
+            );
+            assert!(!escaped.ends_with('.') && !escaped.ends_with(' '));
+            assert_eq!(unescape_relative_path(&escaped).as_deref(), Some(relative));
+            let name = root_dir_name("r", relative);
+            assert_eq!(
+                parse_root_dir_name(&name),
+                Some(("r", relative.to_string()))
+            );
+        }
+        assert_eq!(escape_relative_path("a/b%c"), "a%2Fb%25c");
+    }
+
+    #[test]
+    fn non_ascii_project_names_travel_intact() {
+        let mac = roots(&[("proyectos", "/Users/mateo/proyectos")]);
+        let windows = roots(&[("proyectos", r"C:\Users\Mateo\proyectos")]);
+        let path = "/Users/mateo/proyectos/Proyecto_\u{d1}and\u{fa}.v2";
+
+        assert_eq!(
+            root_repo_dir_name(&mac, path).as_deref(),
+            Some("@proyectos@Proyecto_\u{d1}and\u{fa}.v2")
+        );
+        assert_eq!(
+            carried(&mac, path, &windows).as_deref(),
+            Some("C--Users-Mateo-proyectos-Proyecto--and--v2")
+        );
+    }
+
+    #[test]
+    fn names_that_are_not_root_names_are_left_to_the_other_rules() {
+        for name in ["-home-x", "shop", "@@x", "@id", "@id@%zz", "@id@%4"] {
+            assert_eq!(parse_root_dir_name(name), None, "{name}");
+        }
+        assert_eq!(
+            local_project_dir(&rooted(&[("p", "/home/x")]), Path::new("/c"), "@p@..%2Fetc"),
+            None,
+            "a relative path cannot climb out of its root"
+        );
+    }
+
+    #[test]
+    fn another_machines_root_has_no_destination_until_mapped_here() {
+        let filter = rooted(&[("proyectos", "/home/mateo/proyectos")]);
+        let projects = PathBuf::from("/home/mateo/.claude/projects");
+
+        assert_eq!(local_project_dir(&filter, &projects, "@trabajo@api"), None);
+        assert_eq!(
+            local_project_dir(&filter, &projects, "@proyectos@api"),
+            Some(projects.join("-home-mateo-proyectos-api"))
+        );
+    }
+
+    #[test]
+    fn a_projects_real_path_comes_from_a_cwd_that_encodes_to_its_directory() {
+        let projects = tempfile::TempDir::new().unwrap();
+        let encoded = "-home-mateo-proyectos-shop-web";
+        std::fs::create_dir_all(projects.path().join(encoded)).unwrap();
+        std::fs::write(
+            projects.path().join(encoded).join("s1.jsonl"),
+            "{\"type\":\"summary\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/home/mateo/proyectos/shop-web/src\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/home/mateo/proyectos/shop-web\"}\n",
+        )
+        .unwrap();
+        let filter = rooted(&[("proyectos", "/home/mateo/proyectos")]);
+
+        assert_eq!(
+            repo_dir_name_in(&filter, projects.path(), encoded),
+            "@proyectos@shop-web",
+            "the cwd recorded after a `cd` does not encode to the directory and is skipped"
+        );
+        assert_eq!(
+            repo_dir_name_in(&filter, projects.path(), "-home-mateo-proyectos-empty"),
+            "-home-mateo-proyectos-empty",
+            "without a transcript the encoded name stays"
+        );
+    }
+
+    #[test]
+    fn the_project_map_beats_the_root_map() {
+        let projects = tempfile::TempDir::new().unwrap();
+        let encoded = "-home-mateo-proyectos-shop";
+        std::fs::create_dir_all(projects.path().join(encoded)).unwrap();
+        std::fs::write(
+            projects.path().join(encoded).join("s1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"/home/mateo/proyectos/shop\"}\n",
+        )
+        .unwrap();
+        let mut filter = rooted(&[("proyectos", "/home/mateo/proyectos")]);
+        filter.project_map.insert(
+            "tienda".to_string(),
+            PathBuf::from("/home/mateo/proyectos/shop"),
+        );
+
+        assert_eq!(
+            repo_dir_name_in(&filter, projects.path(), encoded),
+            "tienda"
+        );
+    }
+
+    #[test]
+    fn the_home_directory_is_an_implicit_root_unless_turned_off() {
+        let mut filter = FilterConfig::default();
+        assert!(filter.auto_home_root);
+        let home = crate::sync::discovery::machine_home_dir().unwrap();
+        assert_eq!(effective_roots(&filter).get(HOME_ROOT_ID), Some(&home));
+
+        filter
+            .root_map
+            .insert(HOME_ROOT_ID.to_string(), PathBuf::from("/elsewhere"));
+        assert_eq!(
+            effective_roots(&filter).get(HOME_ROOT_ID),
+            Some(&PathBuf::from("/elsewhere")),
+            "an explicit `home` overrides the implicit one"
+        );
+
+        filter.root_map.clear();
+        filter.auto_home_root = false;
+        assert!(effective_roots(&filter).is_empty());
+    }
+
+    #[test]
+    fn a_root_id_must_be_a_plain_name() {
+        for bad in ["", ".", "..", "a/b", "a@b", "a b", "a%b", "c:"] {
+            let map: RootMap = [(bad.to_string(), PathBuf::from("/home/x"))]
+                .into_iter()
+                .collect();
+            assert!(validate_roots(&map).is_err(), "{bad:?} must be refused");
+        }
+        let relative: RootMap = [("p".to_string(), PathBuf::from("rel/dir"))]
+            .into_iter()
+            .collect();
+        assert!(validate_roots(&relative).is_err());
+        let fine: RootMap = [("proyectos".to_string(), PathBuf::from("/home/x"))]
+            .into_iter()
+            .collect();
+        assert!(validate_roots(&fine).is_ok());
+    }
+
+    #[test]
+    fn a_project_filed_under_an_unmapped_root_says_to_map_the_root() {
+        let misses = skipped(&[("@trabajo@api", &["/repo/projects/@trabajo@api/s.jsonl"])]);
+        let lines = skipped_project_warnings(&misses, false);
+        assert!(lines[0].contains("--map-root"), "{}", lines[0]);
+        assert!(lines[0].contains("trabajo"), "{}", lines[0]);
+        assert!(!lines[0].contains("--map-project"), "{}", lines[0]);
     }
 
     #[test]

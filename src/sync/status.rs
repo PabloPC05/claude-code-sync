@@ -49,6 +49,24 @@ pub fn show_status(show_conflicts: bool, show_files: bool, held_back: bool) -> R
         );
     }
 
+    // Where projects go in the sync repo
+    println!();
+    println!("{}", "Roots:".bold());
+    let roots = crate::project_map::effective_roots(&filter);
+    if roots.is_empty() {
+        println!("  {}", "none".dimmed());
+    }
+    for (id, path) in &roots {
+        println!("  {} -> {}", format!("@{id}@").cyan(), path.display());
+    }
+    if !filter.project_map.is_empty() {
+        println!(
+            "  {} {}",
+            "Mapped projects:".bold(),
+            filter.project_map.len()
+        );
+    }
+
     // Session counts
     println!();
     println!("{}", "Sessions:".bold());

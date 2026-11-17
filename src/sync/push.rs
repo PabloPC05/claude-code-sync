@@ -54,9 +54,10 @@ pub struct PushReport {
 }
 
 /// Compute a session's destination path relative to the projects directory: a
-/// mapped project goes under its canonical id, otherwise `use_project_name_only`
-/// and the plain encoded path decide, exactly as before. Returns None when the
-/// session lacks the `cwd` needed for project-name mapping.
+/// mapped project goes under its canonical id, a project below a root under
+/// `@<root>@<path>`, otherwise `use_project_name_only` and the plain encoded
+/// path decide, exactly as before. Returns None when the session lacks the
+/// `cwd` needed for project-name mapping.
 fn compute_relative_path(
     session: &crate::parser::ConversationSession,
     claude_dir: &Path,
@@ -69,8 +70,8 @@ fn compute_relative_path(
 
     let mut parts = full_relative.components();
     let encoded_dir = parts.next()?.as_os_str().to_str()?;
-    if let Some(id) = crate::project_map::canonical_id(&filter.project_map, encoded_dir) {
-        return Some(Path::new(&id).join(parts.as_path()));
+    if let Some(name) = crate::project_map::mapped_repo_dir_name(filter, claude_dir, encoded_dir) {
+        return Some(Path::new(&name).join(parts.as_path()));
     }
 
     if filter.use_project_name_only {

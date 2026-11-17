@@ -25,6 +25,20 @@ pub(crate) fn claude_home_dir() -> Result<PathBuf> {
     Ok(home.join(".claude"))
 }
 
+/// This machine's home directory: the implicit root `home`.
+///
+/// `CLAUDE_CODE_SYNC_HOME` overrides it, mirroring
+/// `CLAUDE_CODE_SYNC_CLAUDE_DIR`: on Windows the profile folder comes from
+/// the known-folder API, so faking HOME cannot redirect it there.
+pub(crate) fn machine_home_dir() -> Option<PathBuf> {
+    if let Ok(override_dir) = std::env::var("CLAUDE_CODE_SYNC_HOME") {
+        if !override_dir.is_empty() {
+            return Some(PathBuf::from(override_dir));
+        }
+    }
+    dirs::home_dir()
+}
+
 /// Get the Claude Code projects directory
 pub(crate) fn claude_projects_dir() -> Result<PathBuf> {
     Ok(claude_home_dir()?.join("projects"))
